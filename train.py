@@ -1,13 +1,16 @@
 import os
-from datasets import Audio, Dataset, load_dataset
+from datasets.arrow_reader import DownloadConfig
+import huggingface_hub
+import datasets
 from random import randint
+
+os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "1"
 
 SAMPLE_RATE = 44100
 
-os.makedirs("./audiocraft/dataset/lofi-train", exist_ok=True)
-
-ds = load_dataset(
+ds = datasets.load_dataset(
     "vikhyatk/lofi",
-    split="train[:100]",
+    split="train[10:20]",
+    download_config=DownloadConfig(num_proc=32),
+    num_proc=64,
 )
-ds = ds.cast_column("audio", Audio(sampling_rate=SAMPLE_RATE))
