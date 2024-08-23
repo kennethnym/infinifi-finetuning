@@ -1,6 +1,6 @@
 import os
 import datasets
-import torchaudio
+import soundfile
 
 from torch.utils.data import DataLoader
 
@@ -28,6 +28,6 @@ for row in iter(loader):
 
     audio_list = row["audio"]["array"]
     for i, data in enumerate(audio_list):
-        torchaudio.save(f"cache/{i}.mp3", data, sample_rate=SAMPLE_RATE, format="mp3")
+        soundfile.write(f"cache/{i}.mp3", data, SAMPLE_RATE, format="mp3")
 
     i += 1
