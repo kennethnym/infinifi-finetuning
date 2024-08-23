@@ -1,6 +1,5 @@
 import os
 import datasets
-import soundfile
 import random
 import json
 
@@ -41,7 +40,7 @@ ds = datasets.load_dataset(
     split="train",
     streaming=True,
 )
-ds = ds.cast_column("audio", datasets.Audio(sampling_rate=SAMPLE_RATE))
+ds = ds.cast_column("audio", datasets.Audio(sampling_rate=SAMPLE_RATE, decode=False))
 
 loader = DataLoader(ds, batch_size=32, num_workers=4)
 
@@ -50,18 +49,19 @@ for row in iter(loader):
     if i == SAMPLE_SIZE:
         break
 
-    audio_list = row["audio"]["array"]
+    audio_list = row["audio"]["bytes"]
     for j, data in enumerate(audio_list):
-        soundfile.write(
-            f"audiocraft/dataset/lofi/{j}.mp3", data, SAMPLE_RATE, format="mp3"
-        )
+        music_id = row["id"][j]
+
+        with open(f"audiocraft/dataset/lofi/{music_id}.mp3", "wb") as f:
+            f.write(data)
 
         entry = {
             "sample_rate": SAMPLE_RATE,
             "file_extension": "mp3",
             "description": row["prompt"][j],
             "duration": 29,
-            "path": f"dataset/lofi/{row["id"][j]}.mp3",
+            "path": f"dataset/lofi/{music_id}.mp3",
         }
 
         if random.random() < TRAIN_SIZE:
