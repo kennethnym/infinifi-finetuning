@@ -11,7 +11,6 @@ ds = datasets.load_dataset(
     "vikhyatk/lofi",
     use_auth_token=os.environ["TOKEN"],
     split="train",
-    num_proc=64,
     streaming=True,
 )
 
