@@ -1,5 +1,6 @@
 import os
 import datasets
+import pydub
 from huggingface_hub import hf_hub_download
 
 from torch.utils.data import DataLoader
@@ -17,6 +18,7 @@ ds = datasets.load_dataset(
     split="train",
     streaming=True,
 )
+ds = ds.cast_column("audio", datasets.Audio(sampling_rate=SAMPLE_RATE))
 
 loader = DataLoader(ds, batch_size=32, num_workers=4)
 
@@ -25,8 +27,14 @@ for row in iter(loader):
     if i == 1:
         break
 
-    paths = row["audio"]["path"]
-    for path in paths:
-        hf_hub_download(REPO, filename=path, local_dir="cache", token=auth_token)
+    audio_list = row["audio"]["array"]
+    for i, data in enumerate(audio_list):
+        audio_segment = pydub.AudioSegment(
+            data.to_bytes(),
+            frame_rate=SAMPLE_RATE,
+            sample_width=data.dtype.itemsize,
+            channels=1,
+        )
+        audio_segment.export(f"cache/{i}.mp3", format="mp3")
 
     i += 1
