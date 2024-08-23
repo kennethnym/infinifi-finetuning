@@ -1,7 +1,6 @@
 import os
 import datasets
-import pydub
-from huggingface_hub import hf_hub_download
+import torchaudio
 
 from torch.utils.data import DataLoader
 
@@ -29,12 +28,6 @@ for row in iter(loader):
 
     audio_list = row["audio"]["array"]
     for i, data in enumerate(audio_list):
-        audio_segment = pydub.AudioSegment(
-            data.to_bytes(),
-            frame_rate=SAMPLE_RATE,
-            sample_width=data.dtype.itemsize,
-            channels=1,
-        )
-        audio_segment.export(f"cache/{i}.mp3", format="mp3")
+        torchaudio.save(f"cache/{i}.mp3", data, sample_rate=SAMPLE_RATE, format="mp3")
 
     i += 1
