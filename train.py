@@ -61,7 +61,7 @@ for row in iter(loader):
             "file_extension": "mp3",
             "description": row["prompt"][j],
             "duration": 29,
-            "path": f"dataset/lofi/{j}.mp3",
+            "path": f"dataset/lofi/{row["id"][j]}.mp3",
         }
 
         if random.random() < TRAIN_SIZE:
