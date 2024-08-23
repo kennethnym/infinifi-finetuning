@@ -9,9 +9,11 @@ os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "1"
 SAMPLE_RATE = 44100
 REPO = "vikhyatk/lofi"
 
+auth_token = os.environ["TOKEN"]
+
 ds = datasets.load_dataset(
     REPO,
-    use_auth_token=os.environ["TOKEN"],
+    use_auth_token=auth_token,
     split="train",
     streaming=True,
 )
@@ -23,5 +25,8 @@ for row in iter(loader):
     if i == 1:
         break
 
-    relpath = row["audio"]["path"]
-    hf_hub_download(REPO, filename=relpath, local_dir="cache")
+    paths = row["audio"]["path"]
+    for path in paths:
+        hf_hub_download(REPO, filename=path, local_dir="cache", token=auth_token)
+
+    i += 1
