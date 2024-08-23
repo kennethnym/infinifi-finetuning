@@ -1,8 +1,7 @@
 import os
-from datasets.arrow_reader import DownloadConfig
-import huggingface_hub
 import datasets
-from random import randint
+
+from torch.utils.data import DataLoader
 
 os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "1"
 
@@ -10,7 +9,13 @@ SAMPLE_RATE = 44100
 
 ds = datasets.load_dataset(
     "vikhyatk/lofi",
-    split="train[10:20]",
-    download_config=DownloadConfig(num_proc=32),
+    use_auth_token=os.environ["TOKEN"],
+    split="train",
     num_proc=64,
+    streaming=True,
 )
+
+loader = DataLoader(ds, batch_size=32, num_workers=4)
+
+for row in iter(ds):
+    print(row)
