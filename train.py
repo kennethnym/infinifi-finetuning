@@ -27,7 +27,7 @@ for row in iter(loader):
         break
 
     audio_list = row["audio"]["array"]
-    for i, data in enumerate(audio_list):
-        soundfile.write(f"cache/{i}.mp3", data, SAMPLE_RATE, format="mp3")
+    for j, data in enumerate(audio_list):
+        soundfile.write(f"cache/{j}.mp3", data, SAMPLE_RATE, format="mp3")
 
     i += 1
