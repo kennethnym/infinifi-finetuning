@@ -11,7 +11,7 @@ SAMPLE_RATE = 44100
 TRAIN_SIZE = 0.8
 REPO = "vikhyatk/lofi"
 
-batch_count = os.environ["BATCH_COUNT"]
+batch_count = int(os.environ["BATCH_COUNT"])
 auth_token = os.environ["TOKEN"]
 
 os.makedirs("audiocraft/dataset/lofi", exist_ok=True)
