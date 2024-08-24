@@ -42,7 +42,7 @@ ds = datasets.load_dataset(
 )
 ds = ds.cast_column("audio", datasets.Audio(sampling_rate=SAMPLE_RATE, decode=False))
 
-loader = DataLoader(ds, batch_size=32, num_workers=4, shuffle=True)
+loader = DataLoader(ds, batch_size=32, num_workers=4)
 
 i = 0
 for row in iter(loader):
