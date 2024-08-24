@@ -8,10 +8,10 @@ from torch.utils.data import DataLoader
 os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "1"
 
 SAMPLE_RATE = 44100
-SAMPLE_SIZE = 200
 TRAIN_SIZE = 0.8
 REPO = "vikhyatk/lofi"
 
+batch_count = os.environ["BATCH_COUNT"]
 auth_token = os.environ["TOKEN"]
 
 os.makedirs("audiocraft/dataset/lofi", exist_ok=True)
@@ -42,13 +42,13 @@ ds = datasets.load_dataset(
 )
 ds = ds.cast_column("audio", datasets.Audio(sampling_rate=SAMPLE_RATE, decode=False))
 
-loader = DataLoader(ds, batch_size=32, num_workers=4)
+loader = DataLoader(ds, batch_size=32, num_workers=4, shuffle=True)
 
 i = 0
 for row in iter(loader):
     print(f"processing batch {i}...")
 
-    if i == SAMPLE_SIZE:
+    if i == batch_count:
         break
 
     audio_list = row["audio"]["bytes"]
