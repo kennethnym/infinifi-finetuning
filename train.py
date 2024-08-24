@@ -46,6 +46,8 @@ loader = DataLoader(ds, batch_size=32, num_workers=4)
 
 i = 0
 for row in iter(loader):
+    print(f"processing batch {i}...")
+
     if i == SAMPLE_SIZE:
         break
 
