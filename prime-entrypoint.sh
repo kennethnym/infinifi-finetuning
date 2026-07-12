@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# Prime Intellect template startup requirements:
+# https://docs.primeintellect.ai/tutorials-on-demand-cloud/deploy-custom-docker-image#configure-template-startup-script
+
 mkdir -p /root/.ssh /var/run/sshd
 chmod 700 /root/.ssh
 
