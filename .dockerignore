@@ -1,0 +1,11 @@
+.git
+.gitignore
+.venv
+__pycache__
+*.py[cod]
+.cache
+.pytest_cache
+.ruff_cache
+audiocraft
+checkpoints
+outputs
