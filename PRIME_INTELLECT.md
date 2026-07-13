@@ -6,8 +6,8 @@ and checks out the exact AudioCraft commit recorded by this repository.
 
 Prime Intellect's custom-image documentation requires `openssh-server` for pod
 access. It injects `PUBLIC_KEY` and `SSH_PORT` into the container startup
-script. This image handles both variables in its default command and generates
-unique SSH host keys each time a pod starts.
+script. The image installs and configures SSH; the Prime template startup
+script handles both variables and starts the server.
 
 Official references:
 
@@ -33,12 +33,25 @@ Hugging Face models, training outputs, or checkpoints.
 1. Create a custom template using the pushed image name.
 2. Set `PUBLIC_KEY` to your complete SSH public key.
 3. Set `SSH_PORT` to the template's exposed SSH port (normally `22`).
-4. Leave the container start script empty so the image's default command runs.
-   If the template requires a script, use:
+4. Set the Container Start Script in the template's Advanced section to the
+   contents of `prime-entrypoint.sh`:
 
    ```bash
    #!/bin/bash
-   exec /usr/local/bin/prime-entrypoint
+
+   mkdir -p /root/.ssh /var/run/sshd
+   chmod 700 /root/.ssh
+
+   if [[ -n "${PUBLIC_KEY:-}" ]]; then
+       printf '%s\n' "${PUBLIC_KEY}" > /root/.ssh/authorized_keys
+       chmod 600 /root/.ssh/authorized_keys
+   fi
+
+   ssh_port="${SSH_PORT:-22}"
+   sed -i '/^#*Port /d' /etc/ssh/sshd_config
+   printf 'Port %s\n' "${ssh_port}" >> /etc/ssh/sshd_config
+
+   exec /usr/sbin/sshd -D -e
    ```
 
 5. Select GPU hardware whose NVIDIA driver supports CUDA 12.1.
@@ -84,13 +97,15 @@ docker run --rm --gpus all \
   python -c "import torch; print(torch.cuda.get_device_name(), torch.cuda.is_available())"
 ```
 
-Because the image has a `CMD`, supplying `python ...` as above replaces the SSH
-server for one-off checks. To test SSH, run the default command:
+To test SSH, mount and run the same startup script used by the Prime template:
 
 ```bash
 docker run --rm --gpus all --ipc=host --shm-size=8g \
   -p 2222:22 \
   -e SSH_PORT=22 \
   -e PUBLIC_KEY="$(cat ~/.ssh/id_ed25519.pub)" \
-  <dockerhub-user>/infinifi-finetuning:latest
+  -v "$(pwd)/prime-entrypoint.sh:/prime-entrypoint.sh:ro" \
+  --entrypoint /bin/bash \
+  <dockerhub-user>/infinifi-finetuning:latest \
+  /prime-entrypoint.sh
 ```
