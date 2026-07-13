@@ -9,6 +9,7 @@ ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1
 
+# Install SSH server and pipeline dependencies
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         build-essential \
@@ -19,14 +20,19 @@ RUN apt-get update \
         libsndfile1-dev \
         openssh-server \
         pkg-config \
-    && mkdir -p /var/run/sshd /root/.ssh /checkpoints/infinifi \
-    && chmod 700 /root/.ssh \
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/*
+
+# Configure SSH
+RUN mkdir -p /var/run/sshd \
     && sed -i 's/#PermitRootLogin prohibit-password/PermitRootLogin prohibit-password/' /etc/ssh/sshd_config \
     && sed -i 's@session\s*required\s*pam_loginuid.so@session optional pam_loginuid.so@g' /etc/pam.d/sshd \
     && printf '\nPasswordAuthentication no\nPubkeyAuthentication yes\n' >> /etc/ssh/sshd_config \
-    && rm -f /etc/ssh/ssh_host_* \
-    && apt-get clean \
-    && rm -rf /var/lib/apt/lists/*
+    && ssh-keygen -A
+
+# Create SSH directory for root
+RUN mkdir -p /root/.ssh /checkpoints/infinifi \
+    && chmod 700 /root/.ssh
 
 RUN curl -Ls https://micro.mamba.pm/api/micromamba/linux-64/latest \
         | tar -xj -C /usr/local/bin --strip-components=1 bin/micromamba \
@@ -51,11 +57,8 @@ RUN git clone https://github.com/facebookresearch/audiocraft.git /workspace/audi
     && rm -rf /workspace/audiocraft/.git
 
 COPY prepare.py generate.py train.sh ./
-COPY prime-entrypoint.sh /usr/local/bin/prime-entrypoint
 
-RUN chmod +x /workspace/train.sh /usr/local/bin/prime-entrypoint \
+RUN chmod +x /workspace/train.sh \
     && python -c "import audiocraft, datasets, keybert, torch; print(f'torch={torch.__version__}, cuda={torch.version.cuda}')"
 
 EXPOSE 22
-
-CMD ["/usr/local/bin/prime-entrypoint"]

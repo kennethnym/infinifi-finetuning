@@ -21,9 +21,5 @@ fi
 sed -i '/^#*Port /d' /etc/ssh/sshd_config
 printf 'Port %s\n' "${ssh_port}" >> /etc/ssh/sshd_config
 
-# Generate unique host keys when each pod starts instead of baking shared keys
-# into the image.
-ssh-keygen -A
-
 echo "Starting SSH server on port ${ssh_port}"
 exec /usr/sbin/sshd -D -e
