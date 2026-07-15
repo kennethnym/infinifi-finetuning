@@ -234,3 +234,6 @@ pyvenv.cfg
 pip-selfcheck.json
 
 # End of https://www.toptal.com/developers/gitignore/api/python,venv,macos,linux
+
+# Generated evaluation runs contain large audio artifacts.
+/runs/
