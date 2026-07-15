@@ -69,16 +69,29 @@ After connecting as `root`, the repository is available at `/workspace`:
 
 ```bash
 cd /workspace
+python eval/generate.py --model facebook/musicgen-small --run-name baseline_musicgen_small --dry-run
+python eval/generate.py --model facebook/musicgen-small --run-name baseline_musicgen_small
 BATCH_COUNT=1 python prepare.py
 bash train.sh
-python generate.py
+DORA_SIGNATURE=aec31258  # Replace with the signature printed by Dora.
+python export_checkpoint.py --signature "$DORA_SIGNATURE" --output-dir /checkpoints/infinifi
+python eval/generate.py --model /checkpoints/infinifi --run-name finetuned_infinifi --dry-run
+python eval/generate.py --model /checkpoints/infinifi --run-name finetuned_infinifi
 ```
+
+Run the baseline generator before fine-tuning. It writes the plain
+`facebook/musicgen-small` WAVs and reproducibility manifests under
+`/workspace/runs/baseline_musicgen_small`.
 
 Increase `BATCH_COUNT` after the one-batch preparation test succeeds.
 `prepare.py` writes its dataset and manifests under `/workspace/audiocraft`.
 AudioCraft/Dora writes training runs according to its default grid and cache
-configuration. Before generation, update the hard-coded Dora experiment
-signature in `generate.py` to the signature printed by the new training run.
+configuration. After training, pass the Dora signature to
+`export_checkpoint.py`. Exporting only packages the LM and pinned
+`facebook/encodec_32khz` compression model; `eval/generate.py` performs audio
+generation for both pretrained model IDs and exported package directories.
+The fine-tuned example writes to the distinct
+`/workspace/runs/finetuned_infinifi` run directory.
 The image defaults `AUDIOCRAFT_DORA_DIR` to `/workspace/.cache/dora`; override
 it with a persistent-disk path for real training.
 

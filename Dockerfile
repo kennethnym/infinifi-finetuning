@@ -56,7 +56,8 @@ RUN git clone https://github.com/facebookresearch/audiocraft.git /workspace/audi
     && python -m pip install --no-cache-dir --no-deps -e /workspace/audiocraft \
     && rm -rf /workspace/audiocraft/.git
 
-COPY prepare.py generate.py train.sh ./
+COPY prepare.py export_checkpoint.py train.sh ./
+COPY eval ./eval
 
 RUN chmod +x /workspace/train.sh \
     && python -c "import audiocraft, datasets, keybert, torch; print(f'torch={torch.__version__}, cuda={torch.version.cuda}')"
