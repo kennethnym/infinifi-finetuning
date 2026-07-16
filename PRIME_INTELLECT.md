@@ -92,6 +92,21 @@ configuration. After training, pass the Dora signature to
 generation for both pretrained model IDs and exported package directories.
 The fine-tuned example writes to the distinct
 `/workspace/runs/finetuned_infinifi` run directory.
+
+After increasing `BATCH_COUNT` enough for `prepare.py` to materialize all
+twenty frozen `dataset_eval` references, score both generated corpora:
+
+```bash
+python eval/score.py --run-name baseline_musicgen_small --dry-run
+python eval/score.py --run-name baseline_musicgen_small
+python eval/score.py --run-name finetuned_infinifi --dry-run
+python eval/score.py --run-name finetuned_infinifi
+```
+
+The scorer writes aggregate metrics and per-clip scores beside each generated
+run. See `eval/README.md` for metric definitions, checkpoint requirements, and
+output formats.
+
 The image defaults `AUDIOCRAFT_DORA_DIR` to `/workspace/.cache/dora`; override
 it with a persistent-disk path for real training.
 

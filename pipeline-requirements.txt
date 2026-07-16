@@ -1,5 +1,10 @@
-# Dependencies used directly by prepare.py but not supplied by AudioCraft.
+# Pipeline and offline evaluation dependencies not supplied by AudioCraft.
 datasets==3.0.1
 hf-transfer==0.1.8
+hear21passt==0.0.26
 keybert==0.8.5
+laion-clap==1.1.7
+resampy==0.4.3
 sentence-transformers==2.7.0
+timm==0.9.16
+torchvggish==0.2
