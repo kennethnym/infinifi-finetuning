@@ -69,6 +69,8 @@ After connecting as `root`, the repository is available at `/workspace`:
 
 ```bash
 cd /workspace
+python eval/prepare_references.py --dry-run
+python eval/prepare_references.py
 python eval/generate.py --model facebook/musicgen-small --run-name baseline_musicgen_small --dry-run
 python eval/generate.py --model facebook/musicgen-small --run-name baseline_musicgen_small
 BATCH_COUNT=1 python prepare.py
@@ -92,6 +94,13 @@ configuration. After training, pass the Dora signature to
 generation for both pretrained model IDs and exported package directories.
 The fine-tuned example writes to the distinct
 `/workspace/runs/finetuned_infinifi` run directory.
+
+Reference preparation downloads two 500-track corpora under
+`/workspace/references`. Put `--output-root` on attached persistent storage if
+the corpora must survive pod deletion. The software is MIT-licensed, but the
+downloaded reference audio retains its source Creative Commons licenses and
+includes non-commercial tracks. See `eval/README.md` for the exact source
+revisions, selection rules, attribution files, and current scorer limitation.
 
 After increasing `BATCH_COUNT` enough for `prepare.py` to materialize all
 twenty frozen `dataset_eval` references, score both generated corpora:
