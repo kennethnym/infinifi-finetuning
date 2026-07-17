@@ -39,6 +39,85 @@ domain, not general realism against recorded music.
 The expected SHA-256 digest of `prompts.jsonl` is recorded in
 `prompts.sha256`.
 
+## Prepare FAD reference corpora
+
+`prepare_references.py` builds two frozen, 500-track corpora:
+
+- `musicgen-large-v1` contains the twenty existing paired references plus 480
+  additional tracks from the deterministic held-out portion of
+  `vikhyatk/lofi`.
+- `human-fma-lofi-v1` contains human-produced tracks with the exact FMA
+  `Lo-Fi` genre. It accepts only CC-BY 3.0/4.0 and CC-BY-NC 3.0/4.0 tracks,
+  rejects NoDerivatives and ShareAlike licenses, and selects tracks with a
+  deterministic artist-balanced order.
+
+### Human-reference provenance
+
+The human corpus is materialized from:
+
+- Hugging Face dataset:
+  [`benjamin-paine/free-music-archive-large`](https://huggingface.co/datasets/benjamin-paine/free-music-archive-large)
+- Frozen revision: `d4cb3e133a7c5a007ddd20458aa30aef8968cf27`
+- Upstream corpus: [Free Music Archive (FMA)](https://github.com/mdeff/fma)
+- Upstream publication:
+  [FMA: A Dataset for Music Analysis](https://arxiv.org/abs/1612.01840),
+  Defferrard, Benzi, Vandergheynst, and Bresson, ISMIR 2017
+
+The pinned Hugging Face package contains 105,024 FMA tracks represented as
+30-second MP3 excerpts. Of those, 6,027 carry the exact FMA `Lo-Fi` genre;
+572 also use one of the accepted CC-BY or CC-BY-NC licenses. The builder
+deterministically selects 500 of those 572 candidates while cycling across
+artists to reduce artist concentration.
+
+FMA is a historical, artist-uploaded archive collected in 2017 and is used
+here as a pre-modern-generative-music proxy for human-produced audio. The
+source schema has no explicit `human_produced` field, so the script does not
+independently verify authorship.
+
+For every selected track, `manifest.jsonl` records the pinned dataset row,
+title, artist, album, original FMA URLs, genre and tag metadata, exact license,
+audio SHA-256, and decoded audio properties. `ATTRIBUTION.md` renders the
+per-track artist, title, source, and license obligations in a readable form.
+The original MP3 bytes are preserved without cropping, normalization, or
+re-encoding.
+
+Inspect both pinned selections without writing files:
+
+```bash
+python eval/prepare_references.py --dry-run
+```
+
+The synthetic dry run still streams source audio because that dataset embeds
+audio bytes in its Parquet rows. The FMA scan projects metadata columns only.
+
+Materialize both corpora:
+
+```bash
+python eval/prepare_references.py
+```
+
+To prepare one corpus or place outputs on persistent storage:
+
+```bash
+python eval/prepare_references.py \
+  --reference-sets human-fma-lofi-v1 \
+  --output-root /persistent/references
+```
+
+Each output directory contains a locked `config.json`, original MP3 files,
+`manifest.jsonl`, `manifest.sha256`, and `ATTRIBUTION.md`. Interrupted runs
+resume from existing audio. Complete runs are reused only after every audio
+hash and the manifest hash validate.
+
+The repository's MIT license covers the preparation software, not downloaded
+audio. Both reference sources include non-commercial material. The generated
+attribution files preserve each applicable source and license, and these
+corpora must not be represented as MIT-licensed or commercially reusable.
+
+The current scorer still uses the twenty paired references under
+`audiocraft/dataset/lofi/eval`. Support for computing separate FAD values
+against these two 500-track corpora is a subsequent scorer change.
+
 ## Generate the plain-model baseline
 
 Validate the frozen prompt set and inspect the run configuration:

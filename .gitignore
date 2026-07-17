@@ -237,3 +237,6 @@ pip-selfcheck.json
 
 # Generated evaluation runs contain large audio artifacts.
 /runs/
+
+# Materialized evaluation references contain licensed audio artifacts.
+/references/
