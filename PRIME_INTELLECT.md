@@ -74,7 +74,13 @@ python eval/prepare_references.py
 python eval/generate.py --model facebook/musicgen-small --run-name baseline_musicgen_small --dry-run
 python eval/generate.py --model facebook/musicgen-small --run-name baseline_musicgen_small
 BATCH_COUNT=1 python prepare.py
-bash train.sh
+bash train.sh \
+  --epochs 1 \
+  --updates-per-epoch 10 \
+  --segment-duration 5 \
+  --valid-samples 4 \
+  --evaluate-samples 4 \
+  --generate-samples 1
 DORA_SIGNATURE=aec31258  # Replace with the signature printed by Dora.
 python export_checkpoint.py --signature "$DORA_SIGNATURE" --output-dir /checkpoints/infinifi
 python eval/generate.py --model /checkpoints/infinifi --run-name finetuned_infinifi --dry-run
@@ -94,6 +100,44 @@ configuration. After training, pass the Dora signature to
 generation for both pretrained model IDs and exported package directories.
 The fine-tuned example writes to the distinct
 `/workspace/runs/finetuned_infinifi` run directory.
+
+### Fine-tuning
+
+`train.sh` fine-tunes the pretrained `facebook/musicgen-small` model on the
+prepared lo-fi dataset. It does not perform teacher-student distillation. Its
+single-GPU defaults run 5,000 optimizer updates as 10 epochs of 500 updates,
+using 20-second segments and a batch size of two:
+
+```bash
+bash train.sh
+```
+
+Run the default training configuration only after increasing `BATCH_COUNT` and
+preparing a meaningfully sized dataset. The short invocation in the pipeline
+example is an end-to-end smoke test; it is not intended to produce a
+quality-ready checkpoint.
+
+Pass command-line options to change the training budget and memory-sensitive
+settings without editing the script:
+
+| Option | Default |
+| --- | ---: |
+| `--batch-size` | `2` |
+| `--epochs` | `10` |
+| `--updates-per-epoch` | `500` |
+| `--segment-duration` | `20` |
+| `--num-workers` | `4` |
+| `--lr` | `1e-5` |
+| `--warmup-steps` | 5% of total updates (`250`) |
+| `--train-samples` | batch size × updates per epoch (`1000`) |
+| `--valid-samples` | `128` |
+| `--evaluate-samples` | `128` |
+| `--generate-samples` | `4` |
+
+Run `bash train.sh --help` for the complete command reference. Set
+`--batch-size 1` if training runs out of GPU memory. On distributed runs,
+explicitly set `--train-samples` to at least the batch size multiplied by
+updates per epoch and world size.
 
 Reference preparation downloads two 500-track corpora under
 `/workspace/references`. Put `--output-root` on attached persistent storage if
