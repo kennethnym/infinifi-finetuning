@@ -1,24 +1,168 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Single-GPU fine-tuning defaults: 10 epochs x 500 updates = 5,000 updates.
-# Override any value from the environment for shorter tests or larger runs.
-FINETUNE_BATCH_SIZE="${FINETUNE_BATCH_SIZE:-2}"
-FINETUNE_EPOCHS="${FINETUNE_EPOCHS:-10}"
-FINETUNE_UPDATES_PER_EPOCH="${FINETUNE_UPDATES_PER_EPOCH:-500}"
-FINETUNE_SEGMENT_DURATION="${FINETUNE_SEGMENT_DURATION:-20}"
-FINETUNE_NUM_WORKERS="${FINETUNE_NUM_WORKERS:-4}"
-FINETUNE_LR="${FINETUNE_LR:-1e-5}"
+usage() {
+    cat <<'EOF'
+Usage: train.sh [options]
 
-finetune_total_updates=$((FINETUNE_EPOCHS * FINETUNE_UPDATES_PER_EPOCH))
-finetune_default_warmup=$(((finetune_total_updates + 19) / 20))
-finetune_default_train_samples=$((FINETUNE_BATCH_SIZE * FINETUNE_UPDATES_PER_EPOCH))
+Fine-tune facebook/musicgen-small on the prepared lo-fi dataset.
 
-FINETUNE_WARMUP_STEPS="${FINETUNE_WARMUP_STEPS:-${finetune_default_warmup}}"
-FINETUNE_TRAIN_SAMPLES="${FINETUNE_TRAIN_SAMPLES:-${finetune_default_train_samples}}"
-FINETUNE_VALID_SAMPLES="${FINETUNE_VALID_SAMPLES:-128}"
-FINETUNE_EVALUATE_SAMPLES="${FINETUNE_EVALUATE_SAMPLES:-128}"
-FINETUNE_GENERATE_SAMPLES="${FINETUNE_GENERATE_SAMPLES:-4}"
+Options:
+  --batch-size N           Batch size per GPU (default: 2)
+  --epochs N               Number of epochs (default: 10)
+  --updates-per-epoch N    Optimizer updates per epoch (default: 500)
+  --segment-duration SEC   Training segment duration (default: 20)
+  --num-workers N          Data-loader workers (default: 4)
+  --lr RATE                AdamW learning rate (default: 1e-5)
+  --warmup-steps N         Cosine warmup updates (default: 5% of all updates)
+  --train-samples N        Samples per epoch (default: batch size x updates)
+  --valid-samples N        Validation samples per epoch (default: 128)
+  --evaluate-samples N     Evaluation samples (default: 128)
+  --generate-samples N     Generated monitoring samples (default: 4)
+  -h, --help               Show this help
+EOF
+}
+
+fail() {
+    printf 'train.sh: %s\n' "$1" >&2
+    exit 2
+}
+
+require_option_value() {
+    local option="$1"
+    if (( $# < 2 )) || [[ "$2" == --* ]]; then
+        fail "${option} requires a value"
+    fi
+}
+
+require_positive_integer() {
+    local option="$1"
+    local value="$2"
+    [[ "$value" =~ ^[1-9][0-9]*$ ]] ||
+        fail "${option} must be a positive integer"
+}
+
+require_nonnegative_integer() {
+    local option="$1"
+    local value="$2"
+    [[ "$value" =~ ^[0-9]+$ ]] ||
+        fail "${option} must be a non-negative integer"
+}
+
+require_positive_number() {
+    local option="$1"
+    local value="$2"
+    if [[ "$value" =~ ^([0-9]+([.][0-9]*)?|[.][0-9]+)([eE][-+]?[0-9]+)?$ ]]; then
+        local mantissa="${BASH_REMATCH[1]}"
+        [[ -n "${mantissa//[.0]/}" ]] && return
+    fi
+    fail "${option} must be a positive number"
+}
+
+finetune_batch_size=2
+finetune_epochs=10
+finetune_updates_per_epoch=500
+finetune_segment_duration=20
+finetune_num_workers=4
+finetune_lr=1e-5
+finetune_warmup_steps=
+finetune_train_samples=
+finetune_valid_samples=128
+finetune_evaluate_samples=128
+finetune_generate_samples=4
+
+while (( $# > 0 )); do
+    case "$1" in
+        --batch-size)
+            require_option_value "$@"
+            finetune_batch_size="$2"
+            shift 2
+            ;;
+        --epochs)
+            require_option_value "$@"
+            finetune_epochs="$2"
+            shift 2
+            ;;
+        --updates-per-epoch)
+            require_option_value "$@"
+            finetune_updates_per_epoch="$2"
+            shift 2
+            ;;
+        --segment-duration)
+            require_option_value "$@"
+            finetune_segment_duration="$2"
+            shift 2
+            ;;
+        --num-workers)
+            require_option_value "$@"
+            finetune_num_workers="$2"
+            shift 2
+            ;;
+        --lr)
+            require_option_value "$@"
+            finetune_lr="$2"
+            shift 2
+            ;;
+        --warmup-steps)
+            require_option_value "$@"
+            finetune_warmup_steps="$2"
+            shift 2
+            ;;
+        --train-samples)
+            require_option_value "$@"
+            finetune_train_samples="$2"
+            shift 2
+            ;;
+        --valid-samples)
+            require_option_value "$@"
+            finetune_valid_samples="$2"
+            shift 2
+            ;;
+        --evaluate-samples)
+            require_option_value "$@"
+            finetune_evaluate_samples="$2"
+            shift 2
+            ;;
+        --generate-samples)
+            require_option_value "$@"
+            finetune_generate_samples="$2"
+            shift 2
+            ;;
+        -h|--help)
+            usage
+            exit 0
+            ;;
+        *)
+            fail "unknown option: $1"
+            ;;
+    esac
+done
+
+require_positive_integer --batch-size "$finetune_batch_size"
+require_positive_integer --epochs "$finetune_epochs"
+require_positive_integer --updates-per-epoch "$finetune_updates_per_epoch"
+require_positive_number --segment-duration "$finetune_segment_duration"
+require_nonnegative_integer --num-workers "$finetune_num_workers"
+require_positive_number --lr "$finetune_lr"
+require_positive_integer --valid-samples "$finetune_valid_samples"
+require_positive_integer --evaluate-samples "$finetune_evaluate_samples"
+require_positive_integer --generate-samples "$finetune_generate_samples"
+
+finetune_total_updates=$((finetune_epochs * finetune_updates_per_epoch))
+if [[ -z "$finetune_warmup_steps" ]]; then
+    finetune_warmup_steps=$(((finetune_total_updates + 19) / 20))
+    if (( finetune_warmup_steps >= finetune_total_updates )); then
+        finetune_warmup_steps=$((finetune_total_updates - 1))
+    fi
+fi
+require_nonnegative_integer --warmup-steps "$finetune_warmup_steps"
+(( finetune_warmup_steps < finetune_total_updates )) ||
+    fail "--warmup-steps must be lower than the total number of updates"
+
+if [[ -z "$finetune_train_samples" ]]; then
+    finetune_train_samples=$((finetune_batch_size * finetune_updates_per_epoch))
+fi
+require_positive_integer --train-samples "$finetune_train_samples"
 
 dora_args=(
     -P audiocraft
@@ -28,26 +172,26 @@ dora_args=(
     continue_from=//pretrained/facebook/musicgen-small
     conditioner=text2music
     dset=audio/lofi
-    "dataset.num_workers=${FINETUNE_NUM_WORKERS}"
-    "dataset.batch_size=${FINETUNE_BATCH_SIZE}"
-    "dataset.segment_duration=${FINETUNE_SEGMENT_DURATION}"
-    "dataset.train.num_samples=${FINETUNE_TRAIN_SAMPLES}"
-    "dataset.valid.num_samples=${FINETUNE_VALID_SAMPLES}"
-    "dataset.evaluate.num_samples=${FINETUNE_EVALUATE_SAMPLES}"
-    "dataset.generate.num_samples=${FINETUNE_GENERATE_SAMPLES}"
+    "dataset.num_workers=${finetune_num_workers}"
+    "dataset.batch_size=${finetune_batch_size}"
+    "dataset.segment_duration=${finetune_segment_duration}"
+    "dataset.train.num_samples=${finetune_train_samples}"
+    "dataset.valid.num_samples=${finetune_valid_samples}"
+    "dataset.evaluate.num_samples=${finetune_evaluate_samples}"
+    "dataset.generate.num_samples=${finetune_generate_samples}"
     generate.every=5
     generate.lm.prompted_samples=false
-    "optim.epochs=${FINETUNE_EPOCHS}"
-    "optim.updates_per_epoch=${FINETUNE_UPDATES_PER_EPOCH}"
+    "optim.epochs=${finetune_epochs}"
+    "optim.updates_per_epoch=${finetune_updates_per_epoch}"
     optim.optimizer=adamw
-    "optim.lr=${FINETUNE_LR}"
+    "optim.lr=${finetune_lr}"
     "optim.adam.betas=[0.9,0.95]"
     optim.adam.weight_decay=0.01
     optim.ema.use=true
     optim.ema.device=cpu
     optim.ema.updates=10
     schedule.lr_scheduler=cosine
-    "schedule.cosine.warmup=${FINETUNE_WARMUP_STEPS}"
+    "schedule.cosine.warmup=${finetune_warmup_steps}"
     schedule.cosine.lr_min_ratio=0.1
     checkpoint.save_every=5
 )
