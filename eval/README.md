@@ -206,6 +206,8 @@ The scorer computes:
 
 - CLAP text consistency for every generated clip and reports results overall
   and per cohort.
+- CLAP seed diversity by comparing every unordered pair of seeds for the same
+  prompt and then giving every prompt equal weight in the overall result.
 - PaSST KLD for `dataset_eval`, pairing every generated clip with the held-out
   source audio identified by `source_id`.
 - VGGish FAD for generated `dataset_eval` clips against each default or
@@ -270,12 +272,22 @@ checkpoint. The repository's Docker image includes the CLAP, PaSST, and
 VGGish packages needed by the scorer. PaSST and VGGish also download their
 pretrained weights into the Torch cache on first use.
 
-For constrained runs, select individual metrics:
+CLAP seed diversity uses cosine distance between unit-normalized CLAP audio
+embeddings. For each `prompt_id`, it compares all outputs generated from
+different seeds. Its `overall` result summarizes the mean distance for each
+prompt, with every prompt weighted equally; `by_prompt` contains the seed-pair
+summary keyed by the frozen prompt ID. Higher values indicate more
+seed-conditioned variation in CLAP space, but do not independently measure
+quality or prompt adherence. Interpret seed diversity together with CLAP text
+consistency. At least two generation seeds are required.
+
+The standard CLAP pass computes text consistency and seed diversity from the
+same audio embeddings. For constrained runs, select either or both metrics:
 
 ```bash
 python eval/score.py \
   --run-name baseline_musicgen_small \
-  --metrics clap
+  --metrics clap clap_seed_diversity
 ```
 
 Scoring writes the following files beside the generated run:
@@ -287,9 +299,11 @@ runs/<run-name>/
   metrics.json
 ```
 
-`clip_metrics.jsonl` contains CLAP for every clip and KLD values for clips with
-references. `metrics.json` contains aggregate scores and per-cohort CLAP
-summaries. FAD is corpus-level and therefore appears only in `metrics.json`.
+`clip_metrics.jsonl` contains CLAP text consistency for every clip and KLD
+values for clips with references. `metrics.json` contains aggregate and
+per-cohort CLAP summaries, plus the prompt-level CLAP seed-diversity results.
+FAD and seed diversity are not individual-clip metrics and therefore appear
+only in `metrics.json`.
 `score_config.json` locks input manifests, generated and reference audio
 digests, the CLAP checkpoint, metric package/runtime settings, and scorer code.
 For every external FAD corpus it records the corpus path, `reference_set`,
