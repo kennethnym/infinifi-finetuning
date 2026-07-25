@@ -1,8 +1,13 @@
+from contextlib import redirect_stdout
 import importlib.util
+import io
 import json
 from pathlib import Path
+import sys
 import tempfile
+from types import SimpleNamespace
 import unittest
+from unittest import mock
 
 
 SCORER_PATH = Path(__file__).resolve().parents[1] / "eval" / "score.py"
@@ -91,6 +96,65 @@ class EvalScoreTest(unittest.TestCase):
             encoding="utf-8",
         )
         return run_dir
+
+    def write_fad_manifest(
+        self,
+        corpus_dir: Path,
+        records: list[dict[str, object]],
+    ) -> None:
+        manifest_path = corpus_dir / "manifest.jsonl"
+        manifest_path.write_text(
+            "".join(json.dumps(record) + "\n" for record in records),
+            encoding="utf-8",
+        )
+        attribution_path = corpus_dir / "ATTRIBUTION.md"
+        (corpus_dir / "manifest.sha256").write_text(
+            (
+                f"{score.sha256_file(manifest_path)}  manifest.jsonl\n"
+                f"{score.sha256_file(attribution_path)}  ATTRIBUTION.md\n"
+            ),
+            encoding="utf-8",
+        )
+
+    def make_fad_corpus(
+        self,
+        reference_set: str = "human-fma-lofi-v1",
+        *,
+        directory_name: str | None = None,
+        count: int = 2,
+    ) -> tuple[Path, list[dict[str, object]]]:
+        corpus_dir = self.root / (directory_name or reference_set)
+        audio_dir = corpus_dir / "audio"
+        audio_dir.mkdir(parents=True)
+        (corpus_dir / "config.json").write_text(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "reference_set": reference_set,
+                    "target_count": count,
+                }
+            ),
+            encoding="utf-8",
+        )
+        (corpus_dir / "ATTRIBUTION.md").write_text(
+            f"# {reference_set}\n",
+            encoding="utf-8",
+        )
+        records: list[dict[str, object]] = []
+        for index in range(count):
+            audio_path = audio_dir / f"track-{index}.wav"
+            audio_path.write_bytes(f"reference-{index}".encode())
+            records.append(
+                {
+                    "schema_version": 1,
+                    "reference_id": f"track-{index}",
+                    "reference_set": reference_set,
+                    "audio_path": f"audio/track-{index}.wav",
+                    "audio_sha256": score.sha256_file(audio_path),
+                }
+            )
+        self.write_fad_manifest(corpus_dir, records)
+        return corpus_dir, records
 
     def test_loads_complete_generated_run(self) -> None:
         run_dir = self.make_run()
@@ -199,6 +263,337 @@ class EvalScoreTest(unittest.TestCase):
         metrics_path.write_text('{"changed": true}\n', encoding="utf-8")
         with self.assertRaisesRegex(RuntimeError, "already exists or is incomplete"):
             score.existing_result_action(run_dir, score_config, overwrite=False)
+
+    def test_validates_prepared_fad_reference_corpus(self) -> None:
+        corpus_dir, records = self.make_fad_corpus()
+
+        corpus = score.validate_fad_reference_corpus(corpus_dir)
+
+        self.assertEqual(corpus["reference_set"], "human-fma-lofi-v1")
+        self.assertEqual(corpus["reference_count"], len(records))
+        self.assertEqual(
+            corpus["manifest_sha256"],
+            score.sha256_file(corpus_dir / "manifest.jsonl"),
+        )
+        self.assertEqual(len(corpus["audio_paths"]), len(records))
+
+    def test_validates_multiple_fad_reference_corpora(self) -> None:
+        human_dir, _ = self.make_fad_corpus("human-fma-lofi-v1")
+        synthetic_dir, _ = self.make_fad_corpus("musicgen-large-v1")
+
+        corpora = score.validate_fad_reference_corpora(
+            [human_dir, synthetic_dir]
+        )
+
+        self.assertEqual(
+            [corpus["reference_set"] for corpus in corpora],
+            ["human-fma-lofi-v1", "musicgen-large-v1"],
+        )
+
+    def test_cli_accepts_multiple_fad_reference_corpora(self) -> None:
+        arguments = [
+            "score.py",
+            "--run-name",
+            "test-run",
+            "--fad-reference-corpus",
+            "references/first",
+            "--fad-reference-corpus",
+            "references/second",
+        ]
+
+        with mock.patch.object(sys, "argv", arguments):
+            args = score.parse_args()
+
+        self.assertEqual(
+            args.fad_reference_corpus,
+            [Path("references/first"), Path("references/second")],
+        )
+
+    def test_rejects_duplicate_fad_reference_set_names(self) -> None:
+        first_dir, _ = self.make_fad_corpus(
+            "human-fma-lofi-v1",
+            directory_name="first",
+        )
+        second_dir, _ = self.make_fad_corpus(
+            "human-fma-lofi-v1",
+            directory_name="second",
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "Duplicate FAD reference_set"):
+            score.validate_fad_reference_corpora([first_dir, second_dir])
+
+    def test_rejects_bad_fad_manifest_checksum(self) -> None:
+        corpus_dir, _ = self.make_fad_corpus()
+        with (corpus_dir / "manifest.jsonl").open("a", encoding="utf-8") as file:
+            file.write("{}\n")
+
+        with self.assertRaisesRegex(RuntimeError, "manifest checksum mismatch"):
+            score.validate_fad_reference_corpus(corpus_dir)
+
+    def test_rejects_bad_fad_attribution_checksum(self) -> None:
+        corpus_dir, _ = self.make_fad_corpus()
+        with (corpus_dir / "ATTRIBUTION.md").open("a", encoding="utf-8") as file:
+            file.write("changed\n")
+
+        with self.assertRaisesRegex(RuntimeError, "attribution checksum mismatch"):
+            score.validate_fad_reference_corpus(corpus_dir)
+
+    def test_rejects_bad_fad_audio_checksum(self) -> None:
+        corpus_dir, records = self.make_fad_corpus()
+        records[0]["audio_sha256"] = "0" * 64
+        self.write_fad_manifest(corpus_dir, records)
+
+        with self.assertRaisesRegex(RuntimeError, "audio checksum mismatch"):
+            score.validate_fad_reference_corpus(corpus_dir)
+
+    def test_rejects_missing_fad_audio(self) -> None:
+        corpus_dir, _ = self.make_fad_corpus()
+        (corpus_dir / "audio" / "track-0.wav").unlink()
+
+        with self.assertRaisesRegex(RuntimeError, "audio is missing"):
+            score.validate_fad_reference_corpus(corpus_dir)
+
+    def test_rejects_duplicate_fad_reference_ids(self) -> None:
+        corpus_dir, records = self.make_fad_corpus()
+        records[1]["reference_id"] = records[0]["reference_id"]
+        self.write_fad_manifest(corpus_dir, records)
+
+        with self.assertRaisesRegex(RuntimeError, "Duplicate or invalid"):
+            score.validate_fad_reference_corpus(corpus_dir)
+
+    def test_rejects_fad_reference_set_mismatch(self) -> None:
+        corpus_dir, records = self.make_fad_corpus()
+        records[0]["reference_set"] = "musicgen-large-v1"
+        self.write_fad_manifest(corpus_dir, records)
+
+        with self.assertRaisesRegex(RuntimeError, "reference_set mismatch"):
+            score.validate_fad_reference_corpus(corpus_dir)
+
+    def test_rejects_fad_audio_path_traversal(self) -> None:
+        corpus_dir, records = self.make_fad_corpus(count=1)
+        outside_audio = self.root / "outside.wav"
+        outside_audio.write_bytes(b"outside")
+        records[0]["audio_path"] = "../outside.wav"
+        records[0]["audio_sha256"] = score.sha256_file(outside_audio)
+        self.write_fad_manifest(corpus_dir, records)
+
+        with self.assertRaisesRegex(RuntimeError, "contains traversal"):
+            score.validate_fad_reference_corpus(corpus_dir)
+
+    def test_rejects_absolute_fad_audio_path(self) -> None:
+        corpus_dir, records = self.make_fad_corpus(count=1)
+        audio_path = corpus_dir / "audio" / "track-0.wav"
+        records[0]["audio_path"] = str(audio_path.resolve())
+        self.write_fad_manifest(corpus_dir, records)
+
+        with self.assertRaisesRegex(RuntimeError, "must be relative"):
+            score.validate_fad_reference_corpus(corpus_dir)
+
+    def test_rejects_fad_audio_symlink(self) -> None:
+        corpus_dir, records = self.make_fad_corpus(count=1)
+        link_path = corpus_dir / "audio" / "link.wav"
+        link_path.symlink_to("track-0.wav")
+        records[0]["audio_path"] = "audio/link.wav"
+        self.write_fad_manifest(corpus_dir, records)
+
+        with self.assertRaisesRegex(RuntimeError, "cannot use symlinks"):
+            score.validate_fad_reference_corpus(corpus_dir)
+
+    def test_dry_run_prints_fad_reference_corpus(self) -> None:
+        self.make_run()
+        corpus_dir, records = self.make_fad_corpus()
+        arguments = [
+            "score.py",
+            "--run-name",
+            "test-run",
+            "--metrics",
+            "fad",
+            "--fad-reference-corpus",
+            str(corpus_dir),
+            "--dry-run",
+        ]
+        output = io.StringIO()
+
+        with mock.patch.object(sys, "argv", arguments), redirect_stdout(output):
+            score.main()
+
+        dry_run = json.loads(output.getvalue())
+        self.assertEqual(
+            dry_run["fad_reference_corpora"],
+            [
+                {
+                    "path": str(corpus_dir.resolve()),
+                    "reference_set": "human-fma-lofi-v1",
+                    "track_count": len(records),
+                }
+            ],
+        )
+
+    def test_dry_run_uses_both_default_fad_reference_corpora(self) -> None:
+        self.make_run()
+        human_dir, human_records = self.make_fad_corpus("human-fma-lofi-v1")
+        synthetic_dir, synthetic_records = self.make_fad_corpus(
+            "musicgen-large-v1"
+        )
+        arguments = [
+            "score.py",
+            "--run-name",
+            "test-run",
+            "--metrics",
+            "fad",
+            "--dry-run",
+        ]
+        output = io.StringIO()
+
+        with (
+            mock.patch.object(sys, "argv", arguments),
+            mock.patch.object(
+                score,
+                "DEFAULT_FAD_REFERENCE_CORPORA",
+                (human_dir, synthetic_dir),
+            ),
+            redirect_stdout(output),
+        ):
+            score.main()
+
+        dry_run = json.loads(output.getvalue())
+        self.assertEqual(
+            [
+                (corpus["reference_set"], corpus["track_count"])
+                for corpus in dry_run["fad_reference_corpora"]
+            ],
+            [
+                ("human-fma-lofi-v1", len(human_records)),
+                ("musicgen-large-v1", len(synthetic_records)),
+            ],
+        )
+
+    def test_score_config_records_fad_corpus_provenance(self) -> None:
+        run_dir = self.make_run()
+        _, _, records = score.load_run("test-run")
+        corpus_dir, _ = self.make_fad_corpus()
+        corpus = score.validate_fad_reference_corpus(corpus_dir)
+        clip_records = score.make_clip_records(run_dir, records, {}, {}, {})
+        args = SimpleNamespace(
+            run_name="test-run",
+            reference_dir=self.root / "paired",
+            clap_batch_size=4,
+        )
+
+        config = score.make_score_config(
+            args,
+            run_dir,
+            ["fad"],
+            {},
+            clip_records,
+            None,
+            "cpu",
+            [corpus],
+        )
+
+        provenance = config["fad"]["reference_corpora"][0]
+        self.assertEqual(provenance["reference_set"], "human-fma-lofi-v1")
+        self.assertEqual(provenance["reference_count"], 2)
+        self.assertEqual(provenance["config_sha256"], corpus["config_sha256"])
+        self.assertEqual(provenance["manifest_sha256"], corpus["manifest_sha256"])
+        self.assertEqual(
+            provenance["attribution_sha256"],
+            corpus["attribution_sha256"],
+        )
+        self.assertEqual(
+            provenance["combined_audio_sha256"],
+            corpus["combined_audio_sha256"],
+        )
+
+    def test_legacy_fad_uses_paired_dataset_references(self) -> None:
+        run_dir = self.make_run()
+        _, _, records = score.load_run("test-run")
+        reference_path = self.root / "legacy-reference.wav"
+        reference_path.write_bytes(b"reference")
+        references = {
+            "source-1": {
+                "audio_path": reference_path,
+            }
+        }
+        generated_embeddings = SimpleNamespace(shape=(3, 128))
+        reference_embeddings = SimpleNamespace(shape=(2, 128))
+
+        with (
+            mock.patch.object(
+                score,
+                "vggish_embeddings",
+                side_effect=[generated_embeddings, reference_embeddings],
+            ) as embeddings,
+            mock.patch.object(score, "frechet_distance", return_value=4.5),
+        ):
+            result = score.score_fad(run_dir, records, references, "cpu")
+
+        self.assertEqual(result["value"], 4.5)
+        self.assertEqual(result["generated_clip_count"], 1)
+        self.assertEqual(result["reference_clip_count"], 1)
+        self.assertEqual(embeddings.call_count, 2)
+        self.assertEqual(
+            embeddings.call_args_list[1].args[0],
+            [reference_path],
+        )
+
+    def test_reuses_generated_fad_embeddings_across_corpora(self) -> None:
+        run_dir = self.make_run()
+        _, _, records = score.load_run("test-run")
+        first_reference = self.root / "first.wav"
+        second_reference = self.root / "second.wav"
+        first_reference.write_bytes(b"first")
+        second_reference.write_bytes(b"second")
+        corpora = [
+            {
+                "reference_set": "human-fma-lofi-v1",
+                "audio_paths": [first_reference],
+            },
+            {
+                "reference_set": "musicgen-large-v1",
+                "audio_paths": [second_reference],
+            },
+        ]
+        generated_embeddings = SimpleNamespace(shape=(3, 128))
+        first_embeddings = SimpleNamespace(shape=(2, 128))
+        second_embeddings = SimpleNamespace(shape=(4, 128))
+
+        with (
+            mock.patch.object(
+                score,
+                "vggish_embeddings",
+                side_effect=[
+                    generated_embeddings,
+                    first_embeddings,
+                    second_embeddings,
+                ],
+            ) as embeddings,
+            mock.patch.object(
+                score,
+                "frechet_distance",
+                side_effect=[1.25, 2.5],
+            ) as distance,
+        ):
+            result = score.score_fad_reference_corpora(
+                run_dir,
+                records,
+                corpora,
+                "cpu",
+            )
+
+        self.assertEqual(embeddings.call_count, 3)
+        self.assertIs(distance.call_args_list[0].args[1], generated_embeddings)
+        self.assertIs(distance.call_args_list[1].args[1], generated_embeddings)
+        self.assertEqual(
+            result["by_reference_set"]["human-fma-lofi-v1"]["value"],
+            1.25,
+        )
+        self.assertEqual(
+            result["by_reference_set"]["musicgen-large-v1"][
+                "reference_embedding_count"
+            ],
+            4,
+        )
 
 
 if __name__ == "__main__":
