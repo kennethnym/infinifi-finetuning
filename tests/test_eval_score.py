@@ -175,6 +175,16 @@ class EvalScoreTest(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "incomplete or inconsistent"):
             score.load_run("test-run")
 
+    def test_rejects_duplicate_generation_seeds(self) -> None:
+        run_dir = self.make_run()
+        config_path = run_dir / "config.json"
+        config = json.loads(config_path.read_text(encoding="utf-8"))
+        config["seeds"].append(42)
+        config_path.write_text(json.dumps(config), encoding="utf-8")
+
+        with self.assertRaisesRegex(RuntimeError, "invalid seeds"):
+            score.load_run("test-run")
+
     def test_rejects_manifest_identity_mismatch(self) -> None:
         run_dir = self.make_run()
         manifest_path = run_dir / "manifest.jsonl"
@@ -226,6 +236,169 @@ class EvalScoreTest(unittest.TestCase):
         self.assertEqual(result["weight"], 4)
         self.assertEqual(result["mean"], 3.25)
         self.assertAlmostEqual(result["std"], 1.299038105676658)
+
+    def test_clap_seed_diversity_pairs_seeds_within_each_prompt(self) -> None:
+        records = [
+            {
+                "clip_id": "prompt-a__seed-42",
+                "prompt_id": "prompt-a",
+                "cohort": "dataset_eval",
+                "prompt": "Prompt A",
+                "seed": 42,
+            },
+            {
+                "clip_id": "prompt-a__seed-43",
+                "prompt_id": "prompt-a",
+                "cohort": "dataset_eval",
+                "prompt": "Prompt A",
+                "seed": 43,
+            },
+            {
+                "clip_id": "prompt-b__seed-42",
+                "prompt_id": "prompt-b",
+                "cohort": "dataset_eval",
+                "prompt": "Prompt B",
+                "seed": 42,
+            },
+            {
+                "clip_id": "prompt-b__seed-43",
+                "prompt_id": "prompt-b",
+                "cohort": "dataset_eval",
+                "prompt": "Prompt B",
+                "seed": 43,
+            },
+            {
+                "clip_id": "prompt-b__seed-44",
+                "prompt_id": "prompt-b",
+                "cohort": "dataset_eval",
+                "prompt": "Prompt B",
+                "seed": 44,
+            },
+        ]
+        embeddings = {
+            "prompt-a__seed-42": [1.0, 0.0],
+            "prompt-a__seed-43": [0.0, 1.0],
+            "prompt-b__seed-42": [2.0, 0.0],
+            "prompt-b__seed-43": [1.0, 0.0],
+            "prompt-b__seed-44": [3.0, 0.0],
+        }
+
+        result = score.summarize_clap_seed_diversity(records, embeddings)
+
+        self.assertEqual(set(result["by_prompt"]), {"prompt-a", "prompt-b"})
+        self.assertEqual(result["by_prompt"]["prompt-a"]["prompt"], "Prompt A")
+        self.assertEqual(result["by_prompt"]["prompt-a"]["pair_count"], 1)
+        self.assertEqual(result["by_prompt"]["prompt-a"]["mean"], 1.0)
+        self.assertEqual(result["by_prompt"]["prompt-b"]["pair_count"], 3)
+        self.assertEqual(result["by_prompt"]["prompt-b"]["mean"], 0.0)
+        self.assertEqual(result["overall"]["count"], 2)
+        self.assertEqual(result["overall"]["mean"], 0.5)
+        self.assertEqual(result["by_cohort"]["dataset_eval"]["mean"], 0.5)
+
+    def test_clap_seed_diversity_requires_two_seeds_per_prompt(self) -> None:
+        records = [
+            {
+                "clip_id": "prompt-a__seed-42",
+                "prompt_id": "prompt-a",
+                "cohort": "dataset_eval",
+                "prompt": "Prompt A",
+                "seed": 42,
+            }
+        ]
+
+        with self.assertRaisesRegex(RuntimeError, "at least two seeds"):
+            score.summarize_clap_seed_diversity(
+                records,
+                {"prompt-a__seed-42": [1.0, 0.0]},
+            )
+
+    def test_seed_diversity_dry_run_rejects_single_seed_run(self) -> None:
+        self.make_run()
+        arguments = [
+            "score.py",
+            "--run-name",
+            "test-run",
+            "--metrics",
+            "clap_seed_diversity",
+            "--dry-run",
+        ]
+
+        with (
+            mock.patch.object(sys, "argv", arguments),
+            self.assertRaisesRegex(RuntimeError, "at least two generation seeds"),
+        ):
+            score.main()
+
+    def test_seed_diversity_cli_writes_prompt_level_metric(self) -> None:
+        run_dir = self.make_run()
+        config_path = run_dir / "config.json"
+        config = json.loads(config_path.read_text(encoding="utf-8"))
+        config["seeds"].append(43)
+        config_path.write_text(json.dumps(config), encoding="utf-8")
+
+        audio_path = run_dir / "audio" / "dataset-1__seed-43.wav"
+        audio_path.write_bytes(b"generated-43")
+        manifest_path = run_dir / "manifest.jsonl"
+        second_record = json.loads(manifest_path.read_text(encoding="utf-8"))
+        second_record["clip_id"] = "dataset-1__seed-43"
+        second_record["seed"] = 43
+        second_record["audio_path"] = "audio/dataset-1__seed-43.wav"
+        with manifest_path.open("a", encoding="utf-8") as file:
+            file.write(json.dumps(second_record) + "\n")
+
+        arguments = [
+            "score.py",
+            "--run-name",
+            "test-run",
+            "--metrics",
+            "clap_seed_diversity",
+            "--device",
+            "cpu",
+        ]
+        embeddings = {
+            "dataset-1__seed-42": [1.0, 0.0],
+            "dataset-1__seed-43": [0.0, 1.0],
+        }
+        fake_torch = SimpleNamespace(__version__="test")
+
+        with (
+            mock.patch.object(sys, "argv", arguments),
+            mock.patch.dict(sys.modules, {"torch": fake_torch}),
+            mock.patch.object(score, "select_device", return_value="cpu"),
+            mock.patch.object(
+                score,
+                "resolve_clap_checkpoint",
+                return_value=SCORER_PATH,
+            ),
+            mock.patch.object(
+                score,
+                "score_clap",
+                return_value=({}, embeddings),
+            ) as clap,
+            redirect_stdout(io.StringIO()),
+        ):
+            score.main()
+
+        self.assertFalse(clap.call_args.kwargs["include_text_scores"])
+        output = json.loads(
+            (run_dir / "metrics.json").read_text(encoding="utf-8")
+        )
+        diversity = output["metrics"]["clap_seed_diversity"]
+        self.assertEqual(diversity["overall"]["mean"], 1.0)
+        self.assertEqual(
+            diversity["by_prompt"]["dataset-1"]["pair_count"],
+            1,
+        )
+        clip_records = [
+            json.loads(line)
+            for line in (run_dir / "clip_metrics.jsonl")
+            .read_text(encoding="utf-8")
+            .splitlines()
+        ]
+        self.assertEqual(len(clip_records), 2)
+        self.assertTrue(
+            all(record["metrics"] == {} for record in clip_records)
+        )
 
     def test_score_lock_is_exclusive(self) -> None:
         run_dir = self.make_run()
@@ -503,6 +676,33 @@ class EvalScoreTest(unittest.TestCase):
         self.assertEqual(
             provenance["combined_audio_sha256"],
             corpus["combined_audio_sha256"],
+        )
+
+    def test_score_config_records_clap_seed_diversity_method(self) -> None:
+        run_dir = self.make_run()
+        _, _, records = score.load_run("test-run")
+        clip_records = score.make_clip_records(run_dir, records, {}, {}, {})
+        args = SimpleNamespace(
+            run_name="test-run",
+            reference_dir=self.root / "paired",
+            clap_batch_size=4,
+        )
+
+        config = score.make_score_config(
+            args,
+            run_dir,
+            ["clap_seed_diversity"],
+            {},
+            clip_records,
+            SCORER_PATH,
+            "cpu",
+        )
+
+        method = config["clap"]["seed_diversity"]
+        self.assertEqual(method["distance"], "cosine_distance")
+        self.assertEqual(
+            method["pairing"],
+            "all_unordered_seed_pairs_within_each_prompt",
         )
 
     def test_legacy_fad_uses_paired_dataset_references(self) -> None:

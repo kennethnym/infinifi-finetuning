@@ -26,7 +26,8 @@ PROMPTS_CHECKSUM_PATH = Path(__file__).resolve().parent / "prompts.sha256"
 SAFE_RUN_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 AUDIO_SUFFIXES = (".flac", ".mp3", ".ogg", ".wav")
 DATASET_COHORT = "dataset_eval"
-METRIC_ORDER = ("clap", "kld", "fad")
+METRIC_ORDER = ("clap", "clap_seed_diversity", "kld", "fad")
+CLAP_METRICS = frozenset(("clap", "clap_seed_diversity"))
 
 AUDIOCRAFT_COMMIT = "adf0b04a4452f171970028fcf80f101dd5e26e19"
 CLAP_REPOSITORY = "lukewys/laion_clap"
@@ -43,8 +44,8 @@ KLD_PRETRAINED_LENGTH = 20
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Score a completed eval/generate.py run with CLAP text consistency, "
-            "PaSST KLD, and VGGish FAD."
+            "Score a completed eval/generate.py run with CLAP text consistency "
+            "and seed diversity, PaSST KLD, and VGGish FAD."
         )
     )
     parser.add_argument(
@@ -77,7 +78,9 @@ def parse_args() -> argparse.Namespace:
         nargs="+",
         choices=METRIC_ORDER,
         default=list(METRIC_ORDER),
-        help="Metrics to compute. Defaults to clap kld fad.",
+        help=(
+            "Metrics to compute. Defaults to clap clap_seed_diversity kld fad."
+        ),
     )
     parser.add_argument(
         "--device",
@@ -297,6 +300,7 @@ def load_run(
         not isinstance(seeds, list)
         or not seeds
         or not all(isinstance(value, int) and value >= 0 for value in seeds)
+        or len(set(seeds)) != len(seeds)
     ):
         raise RuntimeError("Run config contains invalid seeds")
     if not isinstance(model_source, dict) or not model_source:
@@ -773,7 +777,8 @@ def score_clap(
     device: str,
     batch_size: int,
     checkpoint: Path,
-) -> dict[str, float]:
+    include_text_scores: bool,
+) -> tuple[dict[str, float], dict[str, list[float]]]:
     if batch_size <= 0:
         raise RuntimeError("--clap-batch-size must be greater than zero")
     try:
@@ -795,6 +800,7 @@ def score_clap(
     seed_everything(torch, CLAP_SCORING_SEED)
 
     scores = {}
+    normalized_audio_embeddings = {}
     try:
         for start in range(0, len(records), batch_size):
             batch = records[start : start + batch_size]
@@ -811,18 +817,47 @@ def score_clap(
                     for record in batch
                 ]
             ).squeeze(1)
-            texts = [record["prompt"] for record in batch]
             with torch.inference_mode():
                 audio_embeddings = model.get_audio_embedding_from_data(
                     audio, use_tensor=True
                 )
-                text_embeddings = model.get_text_embedding(texts, use_tensor=True)
-                cosine = torch.nn.functional.cosine_similarity(
+                audio_norms = torch.linalg.vector_norm(
                     audio_embeddings,
-                    text_embeddings,
+                    dim=1,
+                )
+                if (
+                    not torch.isfinite(audio_embeddings).all()
+                    or not torch.isfinite(audio_norms).all()
+                    or torch.any(audio_norms <= 1e-8)
+                ):
+                    raise RuntimeError(
+                        "CLAP produced an invalid audio embedding for clips "
+                        f"{start + 1}-{start + len(batch)}"
+                    )
+                normalized_batch = torch.nn.functional.normalize(
+                    audio_embeddings,
                     dim=1,
                     eps=1e-8,
                 )
+                cosine = None
+                if include_text_scores:
+                    texts = [record["prompt"] for record in batch]
+                    text_embeddings = model.get_text_embedding(
+                        texts, use_tensor=True
+                    )
+                    cosine = torch.nn.functional.cosine_similarity(
+                        audio_embeddings,
+                        text_embeddings,
+                        dim=1,
+                        eps=1e-8,
+                    )
+            embedding_values = normalized_batch.detach().cpu().tolist()
+            for record, embedding in zip(batch, embedding_values):
+                normalized_audio_embeddings[record["clip_id"]] = [
+                    float(value) for value in embedding
+                ]
+            if cosine is None:
+                continue
             for record, value in zip(batch, cosine.detach().cpu().tolist()):
                 if not math.isfinite(value):
                     raise RuntimeError(
@@ -832,7 +867,7 @@ def score_clap(
     finally:
         del model
         release_cuda(torch)
-    return scores
+    return scores, normalized_audio_embeddings
 
 
 def paired_audio(
@@ -1124,6 +1159,113 @@ def summarize_clap(
     }
 
 
+def summarize_clap_seed_diversity(
+    records: list[dict[str, Any]],
+    audio_embeddings: dict[str, list[float]],
+) -> dict[str, Any]:
+    records_by_prompt: dict[str, list[dict[str, Any]]] = {}
+    for record in records:
+        clip_id = record["clip_id"]
+        if clip_id not in audio_embeddings:
+            raise RuntimeError(
+                f"CLAP audio embedding is missing for {clip_id}"
+            )
+        records_by_prompt.setdefault(record["prompt_id"], []).append(record)
+
+    by_prompt = {}
+    for prompt_id in sorted(records_by_prompt):
+        prompt_records = sorted(
+            records_by_prompt[prompt_id],
+            key=lambda record: record["seed"],
+        )
+        if len(prompt_records) < 2:
+            raise RuntimeError(
+                "CLAP seed diversity requires at least two seeds per prompt; "
+                f"{prompt_id} has {len(prompt_records)}"
+            )
+
+        normalized_embeddings = []
+        embedding_size = None
+        for record in prompt_records:
+            embedding = audio_embeddings[record["clip_id"]]
+            if (
+                not isinstance(embedding, list)
+                or not embedding
+                or not all(
+                    isinstance(value, (int, float))
+                    and not isinstance(value, bool)
+                    and math.isfinite(value)
+                    for value in embedding
+                )
+            ):
+                raise RuntimeError(
+                    f"Invalid CLAP audio embedding for {record['clip_id']}"
+                )
+            if embedding_size is None:
+                embedding_size = len(embedding)
+            elif len(embedding) != embedding_size:
+                raise RuntimeError(
+                    f"Inconsistent CLAP embedding size for {record['clip_id']}"
+                )
+            norm = math.sqrt(math.fsum(float(value) ** 2 for value in embedding))
+            if not math.isfinite(norm) or norm <= 1e-8:
+                raise RuntimeError(
+                    f"Invalid CLAP audio embedding norm for {record['clip_id']}"
+                )
+            normalized_embeddings.append(
+                [float(value) / norm for value in embedding]
+            )
+
+        distances = []
+        for left_index, left_embedding in enumerate(normalized_embeddings):
+            for right_embedding in normalized_embeddings[left_index + 1 :]:
+                cosine_similarity = math.fsum(
+                    left * right
+                    for left, right in zip(left_embedding, right_embedding)
+                )
+                cosine_similarity = min(1.0, max(-1.0, cosine_similarity))
+                distance = 1.0 - cosine_similarity
+                if not math.isfinite(distance):
+                    raise RuntimeError(
+                        f"Non-finite CLAP seed distance for {prompt_id}"
+                    )
+                distances.append(distance)
+
+        distance_summary = summary(distances)
+        by_prompt[prompt_id] = {
+            "prompt": prompt_records[0]["prompt"],
+            "cohort": prompt_records[0]["cohort"],
+            "seeds": [record["seed"] for record in prompt_records],
+            "seed_count": len(prompt_records),
+            "pair_count": len(distances),
+            "mean": distance_summary["mean"],
+            "std": distance_summary["std"],
+            "min": distance_summary["min"],
+            "max": distance_summary["max"],
+        }
+
+    cohorts = sorted(
+        {prompt_result["cohort"] for prompt_result in by_prompt.values()}
+    )
+    return {
+        "direction": "higher_is_better",
+        "overall": summary(
+            [prompt_result["mean"] for prompt_result in by_prompt.values()]
+        ),
+        "by_cohort": {
+            cohort: summary(
+                [
+                    prompt_result["mean"]
+                    for prompt_result in by_prompt.values()
+                    if prompt_result["cohort"] == cohort
+                ]
+            )
+            for cohort in cohorts
+        },
+        "by_prompt": by_prompt,
+    }
+
+
 def summarize_kld(
     records: list[dict[str, Any]],
     scores: dict[str, dict[str, float | int]],
@@ -1225,7 +1367,9 @@ def make_score_config(
             "transformers": package_version("transformers"),
             "audiocraft": package_version("audiocraft"),
             "laion-clap": (
-                package_version("laion-clap") if "clap" in metrics else None
+                package_version("laion-clap")
+                if CLAP_METRICS.intersection(metrics)
+                else None
             ),
             "hear21passt": (
                 package_version("hear21passt") if "kld" in metrics else None
@@ -1255,6 +1399,20 @@ def make_score_config(
                 "scoring_seed": CLAP_SCORING_SEED,
                 "batch_size": args.clap_batch_size,
                 "resolved_checkpoint": display_path(clap_checkpoint),
+                "seed_diversity": (
+                    {
+                        "embedding": "unit_normalized_audio_embedding",
+                        "distance": "cosine_distance",
+                        "pairing": (
+                            "all_unordered_seed_pairs_within_each_prompt"
+                        ),
+                        "overall_aggregation": (
+                            "equal_weight_mean_of_per_prompt_mean_distances"
+                        ),
+                    }
+                    if "clap_seed_diversity" in metrics
+                    else None
+                ),
             }
             if clap_checkpoint is not None
             else None
@@ -1328,6 +1486,15 @@ def main() -> None:
     args = parse_args()
     metrics = [name for name in METRIC_ORDER if name in set(args.metrics)]
     run_dir, run_config, records = load_run(args.run_name)
+    uses_clap = bool(CLAP_METRICS.intersection(metrics))
+    if (
+        "clap_seed_diversity" in metrics
+        and len(run_config["seeds"]) < 2
+    ):
+        raise RuntimeError(
+            "CLAP seed diversity requires at least two generation seeds; "
+            f"run {args.run_name!r} has {len(run_config['seeds'])}"
+        )
     fad_reference_paths = []
     if "fad" in metrics:
         fad_reference_paths = (
@@ -1375,9 +1542,13 @@ def main() -> None:
                         for corpus in fad_reference_corpora
                     ],
                     "clap_checkpoint": (
-                        str(args.clap_checkpoint.expanduser())
-                        if args.clap_checkpoint is not None
-                        else f"hf://{CLAP_REPOSITORY}/{CLAP_CHECKPOINT_NAME}"
+                        (
+                            str(args.clap_checkpoint.expanduser())
+                            if args.clap_checkpoint is not None
+                            else f"hf://{CLAP_REPOSITORY}/{CLAP_CHECKPOINT_NAME}"
+                        )
+                        if uses_clap
+                        else None
                     ),
                     "run_model_source": run_config.get("model_source"),
                 },
@@ -1396,7 +1567,7 @@ def main() -> None:
     score_lock = acquire_score_lock(run_dir)
     device = select_device(args.device, torch)
     clap_checkpoint = (
-        resolve_clap_checkpoint(args.clap_checkpoint) if "clap" in metrics else None
+        resolve_clap_checkpoint(args.clap_checkpoint) if uses_clap else None
     )
 
     initial_clip_records = make_clip_records(
@@ -1420,17 +1591,25 @@ def main() -> None:
         return
 
     clap_scores: dict[str, float] = {}
+    clap_audio_embeddings: dict[str, list[float]] = {}
+    clap_seed_diversity_result: dict[str, Any] | None = None
     kld_scores: dict[str, dict[str, float | int]] = {}
     fad_result: dict[str, Any] | None = None
 
-    if "clap" in metrics:
+    if uses_clap:
         assert clap_checkpoint is not None
-        clap_scores = score_clap(
+        clap_scores, clap_audio_embeddings = score_clap(
             run_dir,
             records,
             device,
             args.clap_batch_size,
             clap_checkpoint,
+            include_text_scores="clap" in metrics,
+        )
+    if "clap_seed_diversity" in metrics:
+        clap_seed_diversity_result = summarize_clap_seed_diversity(
+            records,
+            clap_audio_embeddings,
         )
     if "kld" in metrics:
         kld_scores = score_kld(run_dir, records, references, device)
@@ -1464,6 +1643,28 @@ def main() -> None:
                 "checkpoint_sha256": CLAP_CHECKPOINT_SHA256,
                 "architecture": "HTSAT-base",
             },
+        }
+    if clap_seed_diversity_result is not None:
+        metric_results["clap_seed_diversity"] = {
+            **clap_seed_diversity_result,
+            "implementation": {
+                "package": "laion-clap",
+                "package_version": package_version("laion-clap"),
+                "checkpoint": CLAP_CHECKPOINT_NAME,
+                "checkpoint_sha256": CLAP_CHECKPOINT_SHA256,
+                "architecture": "HTSAT-base",
+                "embedding": "unit-normalized CLAP audio embedding",
+                "distance": "cosine distance (1 - cosine similarity)",
+                "pairing": "all unordered seed pairs within each prompt",
+                "overall_aggregation": (
+                    "equal-weight summary of per-prompt mean distances"
+                ),
+            },
+            "interpretation": (
+                "Higher values indicate more seed-conditioned variation in CLAP "
+                "audio space. Read this with CLAP text consistency: diversity "
+                "alone does not measure quality or prompt adherence."
+            ),
         }
     if kld_scores:
         metric_results["kld"] = {
