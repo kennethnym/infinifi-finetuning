@@ -74,7 +74,13 @@ python eval/prepare_references.py
 python eval/generate.py --model facebook/musicgen-small --run-name baseline_musicgen_small --dry-run
 python eval/generate.py --model facebook/musicgen-small --run-name baseline_musicgen_small
 BATCH_COUNT=1 python prepare.py
-bash train.sh
+FINETUNE_EPOCHS=1 \
+FINETUNE_UPDATES_PER_EPOCH=10 \
+FINETUNE_SEGMENT_DURATION=5 \
+FINETUNE_VALID_SAMPLES=4 \
+FINETUNE_EVALUATE_SAMPLES=4 \
+FINETUNE_GENERATE_SAMPLES=1 \
+  bash train.sh
 DORA_SIGNATURE=aec31258  # Replace with the signature printed by Dora.
 python export_checkpoint.py --signature "$DORA_SIGNATURE" --output-dir /checkpoints/infinifi
 python eval/generate.py --model /checkpoints/infinifi --run-name finetuned_infinifi --dry-run
@@ -94,6 +100,43 @@ configuration. After training, pass the Dora signature to
 generation for both pretrained model IDs and exported package directories.
 The fine-tuned example writes to the distinct
 `/workspace/runs/finetuned_infinifi` run directory.
+
+### Fine-tuning
+
+`train.sh` fine-tunes the pretrained `facebook/musicgen-small` model on the
+prepared lo-fi dataset. It does not perform teacher-student distillation. Its
+single-GPU defaults run 5,000 optimizer updates as 10 epochs of 500 updates,
+using 20-second segments and a batch size of two:
+
+```bash
+bash train.sh
+```
+
+Run the default training configuration only after increasing `BATCH_COUNT` and
+preparing a meaningfully sized dataset. The short invocation in the pipeline
+example is an end-to-end smoke test; it is not intended to produce a
+quality-ready checkpoint.
+
+The training budget and memory-sensitive settings can be overridden without
+editing the script:
+
+| Environment variable | Default |
+| --- | ---: |
+| `FINETUNE_BATCH_SIZE` | `2` |
+| `FINETUNE_EPOCHS` | `10` |
+| `FINETUNE_UPDATES_PER_EPOCH` | `500` |
+| `FINETUNE_SEGMENT_DURATION` | `20` |
+| `FINETUNE_NUM_WORKERS` | `4` |
+| `FINETUNE_LR` | `1e-5` |
+| `FINETUNE_WARMUP_STEPS` | 5% of total updates (`250`) |
+| `FINETUNE_TRAIN_SAMPLES` | batch size × updates per epoch (`1000`) |
+| `FINETUNE_VALID_SAMPLES` | `128` |
+| `FINETUNE_EVALUATE_SAMPLES` | `128` |
+| `FINETUNE_GENERATE_SAMPLES` | `4` |
+
+Set `FINETUNE_BATCH_SIZE=1` if training runs out of GPU memory. On distributed
+runs, explicitly set `FINETUNE_TRAIN_SAMPLES` to at least the batch size
+multiplied by updates per epoch and world size.
 
 Reference preparation downloads two 500-track corpora under
 `/workspace/references`. Put `--output-root` on attached persistent storage if
