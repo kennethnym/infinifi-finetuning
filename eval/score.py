@@ -16,6 +16,10 @@ from typing import Any
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 RUNS_ROOT = PROJECT_ROOT / "runs"
 DEFAULT_REFERENCE_DIR = PROJECT_ROOT / "audiocraft" / "dataset" / "lofi" / "eval"
+DEFAULT_FAD_REFERENCE_CORPORA = (
+    PROJECT_ROOT / "references" / "human-fma-lofi-v1",
+    PROJECT_ROOT / "references" / "musicgen-large-v1",
+)
 PROMPTS_PATH = Path(__file__).resolve().parent / "prompts.jsonl"
 PROMPTS_CHECKSUM_PATH = Path(__file__).resolve().parent / "prompts.sha256"
 
@@ -53,8 +57,19 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         default=DEFAULT_REFERENCE_DIR,
         help=(
-            "Prepared held-out audio directory. Required by KLD and FAD; "
-            "defaults to audiocraft/dataset/lofi/eval."
+            "Prepared paired held-out audio directory used by KLD; defaults to "
+            "audiocraft/dataset/lofi/eval."
+        ),
+    )
+    parser.add_argument(
+        "--fad-reference-corpus",
+        action="append",
+        type=Path,
+        default=None,
+        help=(
+            "Prepared distribution-level FAD reference corpus. Repeat to score "
+            "against multiple corpora. Defaults to references/human-fma-lofi-v1 "
+            "and references/musicgen-large-v1."
         ),
     )
     parser.add_argument(
@@ -409,17 +424,9 @@ def resolve_reference_audio(metadata_path: Path) -> Path:
     return audio_path
 
 
-def load_references(
-    reference_dir: Path,
+def validate_dataset_eval_cohort(
     records: list[dict[str, Any]],
-) -> dict[str, dict[str, Any]]:
-    reference_dir = reference_dir.expanduser().resolve()
-    if not reference_dir.is_dir():
-        raise RuntimeError(
-            f"Held-out reference directory not found: {reference_dir}. "
-            "Run prepare.py with enough batches to include the frozen dataset_eval IDs."
-        )
-
+) -> dict[str, str]:
     expected_prompts = {}
     for record in records:
         if record["cohort"] != DATASET_COHORT:
@@ -447,6 +454,21 @@ def load_references(
             f"KLD/FAD require the complete frozen {DATASET_COHORT} cohort: "
             f"missing={missing}, unexpected={unexpected}"
         )
+    return expected_prompts
+
+
+def load_references(
+    reference_dir: Path,
+    records: list[dict[str, Any]],
+) -> dict[str, dict[str, Any]]:
+    reference_dir = reference_dir.expanduser().resolve()
+    if not reference_dir.is_dir():
+        raise RuntimeError(
+            f"Held-out reference directory not found: {reference_dir}. "
+            "Run prepare.py with enough batches to include the frozen dataset_eval IDs."
+        )
+
+    expected_prompts = validate_dataset_eval_cohort(records)
 
     references = {}
     for metadata_path in sorted(reference_dir.glob("*.json")):
@@ -477,6 +499,166 @@ def load_references(
             + ", ".join(missing)
         )
     return references
+
+
+def resolve_fad_reference_audio(corpus_dir: Path, relative_path: Any) -> Path:
+    if not isinstance(relative_path, str) or not relative_path:
+        raise RuntimeError("FAD reference manifest contains an invalid audio_path")
+    supplied = Path(relative_path)
+    if supplied.is_absolute():
+        raise RuntimeError(f"FAD reference audio_path must be relative: {relative_path}")
+    if ".." in supplied.parts:
+        raise RuntimeError(
+            f"FAD reference audio_path contains traversal: {relative_path}"
+        )
+
+    candidate = corpus_dir
+    for part in supplied.parts:
+        candidate = candidate / part
+        if candidate.is_symlink():
+            raise RuntimeError(f"FAD reference audio cannot use symlinks: {candidate}")
+
+    resolved = candidate.resolve()
+    try:
+        resolved.relative_to(corpus_dir)
+    except ValueError as error:
+        raise RuntimeError(
+            f"FAD reference audio_path escapes its corpus: {relative_path}"
+        ) from error
+    if not resolved.is_file():
+        raise RuntimeError(
+            f"FAD reference audio is missing or not a regular file: {resolved}"
+        )
+    return resolved
+
+
+def validate_fad_reference_corpus(path: Path) -> dict[str, Any]:
+    supplied_path = path.expanduser()
+    if not supplied_path.is_dir():
+        raise RuntimeError(f"FAD reference corpus directory not found: {supplied_path}")
+    corpus_dir = supplied_path.resolve()
+    config_path = corpus_dir / "config.json"
+    manifest_path = corpus_dir / "manifest.jsonl"
+    checksum_path = corpus_dir / "manifest.sha256"
+    attribution_path = corpus_dir / "ATTRIBUTION.md"
+
+    config = read_json(config_path)
+    if config.get("schema_version") != 1:
+        raise RuntimeError(
+            f"Unsupported FAD reference corpus schema in {config_path}: "
+            f"{config.get('schema_version')!r}"
+        )
+    reference_set = config.get("reference_set")
+    if not isinstance(reference_set, str) or not reference_set:
+        raise RuntimeError(f"Invalid reference_set in {config_path}")
+    target_count = config.get("target_count")
+    if (
+        isinstance(target_count, bool)
+        or not isinstance(target_count, int)
+        or target_count <= 0
+    ):
+        raise RuntimeError(f"Invalid target_count in {config_path}")
+
+    try:
+        checksum_lines = checksum_path.read_text(encoding="utf-8").splitlines()
+    except FileNotFoundError as error:
+        raise RuntimeError(
+            f"FAD reference checksum file not found: {checksum_path}"
+        ) from error
+    expected_hashes = {}
+    for line in checksum_lines:
+        parts = line.split()
+        if (
+            len(parts) != 2
+            or re.fullmatch(r"[0-9a-fA-F]{64}", parts[0]) is None
+            or parts[1] in expected_hashes
+        ):
+            raise RuntimeError(f"Invalid FAD reference checksum line: {line!r}")
+        expected_hashes[parts[1]] = parts[0].lower()
+    if set(expected_hashes) != {"manifest.jsonl", "ATTRIBUTION.md"}:
+        raise RuntimeError(f"Invalid FAD reference checksum file: {checksum_path}")
+
+    if not manifest_path.is_file():
+        raise RuntimeError(f"FAD reference manifest not found: {manifest_path}")
+    if not attribution_path.is_file():
+        raise RuntimeError(f"FAD reference attribution not found: {attribution_path}")
+    actual_manifest_sha256 = sha256_file(manifest_path)
+    if actual_manifest_sha256 != expected_hashes["manifest.jsonl"]:
+        raise RuntimeError(
+            f"FAD reference manifest checksum mismatch in {corpus_dir}: "
+            f"expected {expected_hashes['manifest.jsonl']}, "
+            f"got {actual_manifest_sha256}"
+        )
+    actual_attribution_sha256 = sha256_file(attribution_path)
+    if actual_attribution_sha256 != expected_hashes["ATTRIBUTION.md"]:
+        raise RuntimeError(
+            f"FAD reference attribution checksum mismatch in {corpus_dir}: "
+            f"expected {expected_hashes['ATTRIBUTION.md']}, "
+            f"got {actual_attribution_sha256}"
+        )
+
+    records = read_jsonl(manifest_path)
+    if len(records) != target_count:
+        raise RuntimeError(
+            f"Expected {target_count} FAD references in {reference_set}, "
+            f"found {len(records)}"
+        )
+
+    seen_ids = set()
+    audio_paths = []
+    audio_fingerprints = {}
+    for record in records:
+        reference_id = record.get("reference_id")
+        if (
+            not isinstance(reference_id, str)
+            or not reference_id
+            or reference_id in seen_ids
+        ):
+            raise RuntimeError(
+                f"Duplicate or invalid FAD reference_id: {reference_id!r}"
+            )
+        if record.get("reference_set") != reference_set:
+            raise RuntimeError(f"FAD reference_set mismatch for {reference_id}")
+        audio_path = resolve_fad_reference_audio(
+            corpus_dir,
+            record.get("audio_path"),
+        )
+        actual_audio_sha256 = sha256_file(audio_path)
+        if record.get("audio_sha256") != actual_audio_sha256:
+            raise RuntimeError(f"FAD reference audio checksum mismatch: {audio_path}")
+        seen_ids.add(reference_id)
+        audio_paths.append(audio_path)
+        audio_fingerprints[reference_id] = actual_audio_sha256
+
+    return {
+        "path": corpus_dir,
+        "reference_set": reference_set,
+        "config": config,
+        "records": records,
+        "audio_paths": audio_paths,
+        "config_sha256": sha256_file(config_path),
+        "manifest_sha256": actual_manifest_sha256,
+        "attribution_sha256": actual_attribution_sha256,
+        "combined_audio_sha256": sha256_json(audio_fingerprints),
+        "reference_count": len(records),
+    }
+
+
+def validate_fad_reference_corpora(paths: list[Path]) -> list[dict[str, Any]]:
+    corpora = []
+    by_reference_set = {}
+    for path in paths:
+        corpus = validate_fad_reference_corpus(path)
+        reference_set = corpus["reference_set"]
+        if reference_set in by_reference_set:
+            raise RuntimeError(
+                "Duplicate FAD reference_set supplied: "
+                f"{reference_set!r} from {by_reference_set[reference_set]} "
+                f"and {corpus['path']}"
+            )
+        by_reference_set[reference_set] = corpus["path"]
+        corpora.append(corpus)
+    return corpora
 
 
 def package_version(package: str) -> str | None:
@@ -858,6 +1040,43 @@ def score_fad(
     }
 
 
+def score_fad_reference_corpora(
+    run_dir: Path,
+    records: list[dict[str, Any]],
+    corpora: list[dict[str, Any]],
+    device: str,
+) -> dict[str, Any]:
+    selected = [record for record in records if record["cohort"] == DATASET_COHORT]
+    generated_paths = [
+        resolve_run_audio(run_dir, record["audio_path"]) for record in selected
+    ]
+    if not generated_paths:
+        raise RuntimeError(
+            f"FAD requires at least one generated {DATASET_COHORT} clip"
+        )
+
+    print(f"extracting VGGish embeddings for {len(generated_paths)} generated clips...")
+    generated_embeddings = vggish_embeddings(generated_paths, device)
+    by_reference_set = {}
+    for corpus in corpora:
+        reference_paths = corpus["audio_paths"]
+        print(
+            "extracting VGGish embeddings for "
+            f"{len(reference_paths)} {corpus['reference_set']} references..."
+        )
+        reference_embeddings = vggish_embeddings(reference_paths, device)
+        by_reference_set[corpus["reference_set"]] = {
+            "value": frechet_distance(reference_embeddings, generated_embeddings),
+            "reference_clip_count": len(reference_paths),
+            "generated_embedding_count": int(generated_embeddings.shape[0]),
+            "reference_embedding_count": int(reference_embeddings.shape[0]),
+        }
+    return {
+        "generated_clip_count": len(generated_paths),
+        "by_reference_set": by_reference_set,
+    }
+
+
 def summary(values: list[float], weights: list[int] | None = None) -> dict[str, Any]:
     if not values:
         raise RuntimeError("Cannot summarize an empty metric")
@@ -973,7 +1192,10 @@ def make_score_config(
     clip_records: list[dict[str, Any]],
     clap_checkpoint: Path | None,
     device: str,
+    fad_reference_corpora: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
+    if fad_reference_corpora is None:
+        fad_reference_corpora = []
     reference_fingerprints = {
         source_id: reference["sha256"]
         for source_id, reference in sorted(references.items())
@@ -1051,6 +1273,18 @@ def make_score_config(
                 "embedding_model": "VGGish",
                 "implementation": "torchvggish_pre_pca_without_final_activation",
                 "cohort": DATASET_COHORT,
+                "reference_corpora": [
+                    {
+                        "path": display_path(corpus["path"]),
+                        "reference_set": corpus["reference_set"],
+                        "config_sha256": corpus["config_sha256"],
+                        "manifest_sha256": corpus["manifest_sha256"],
+                        "attribution_sha256": corpus["attribution_sha256"],
+                        "combined_audio_sha256": corpus["combined_audio_sha256"],
+                        "reference_count": corpus["reference_count"],
+                    }
+                    for corpus in fad_reference_corpora
+                ],
             }
             if "fad" in metrics
             else None
@@ -1094,10 +1328,27 @@ def main() -> None:
     args = parse_args()
     metrics = [name for name in METRIC_ORDER if name in set(args.metrics)]
     run_dir, run_config, records = load_run(args.run_name)
-    needs_references = bool({"kld", "fad"} & set(metrics))
+    fad_reference_paths = []
+    if "fad" in metrics:
+        fad_reference_paths = (
+            args.fad_reference_corpus
+            if args.fad_reference_corpus is not None
+            else list(DEFAULT_FAD_REFERENCE_CORPORA)
+        )
+    fad_reference_corpora = validate_fad_reference_corpora(fad_reference_paths)
+    uses_external_fad_references = bool(fad_reference_corpora)
+    needs_references = "kld" in metrics or (
+        "fad" in metrics and not uses_external_fad_references
+    )
     references = (
         load_references(args.reference_dir, records) if needs_references else {}
     )
+    if (
+        "fad" in metrics
+        and uses_external_fad_references
+        and "kld" not in metrics
+    ):
+        validate_dataset_eval_cohort(records)
 
     if args.dry_run:
         print(
@@ -1115,6 +1366,14 @@ def main() -> None:
                         )
                     },
                     "reference_count": len(references),
+                    "fad_reference_corpora": [
+                        {
+                            "path": str(corpus["path"]),
+                            "reference_set": corpus["reference_set"],
+                            "track_count": corpus["reference_count"],
+                        }
+                        for corpus in fad_reference_corpora
+                    ],
                     "clap_checkpoint": (
                         str(args.clap_checkpoint.expanduser())
                         if args.clap_checkpoint is not None
@@ -1155,6 +1414,7 @@ def main() -> None:
         initial_clip_records,
         clap_checkpoint,
         device,
+        fad_reference_corpora,
     )
     if existing_result_action(run_dir, score_config, args.overwrite):
         return
@@ -1175,7 +1435,15 @@ def main() -> None:
     if "kld" in metrics:
         kld_scores = score_kld(run_dir, records, references, device)
     if "fad" in metrics:
-        fad_result = score_fad(run_dir, records, references, device)
+        if uses_external_fad_references:
+            fad_result = score_fad_reference_corpora(
+                run_dir,
+                records,
+                fad_reference_corpora,
+                device,
+            )
+        else:
+            fad_result = score_fad(run_dir, records, references, device)
 
     clip_records = initial_clip_records
     for record in clip_records:
@@ -1208,22 +1476,53 @@ def main() -> None:
             },
         }
     if fad_result is not None:
-        metric_results["fad"] = {
-            "direction": "lower_is_better",
-            "cohort": DATASET_COHORT,
-            **fad_result,
-            "implementation": {
-                "package": "torchvggish",
-                "package_version": package_version("torchvggish"),
-                "embedding": "VGGish pre-PCA without final activation",
-            },
-            "interpretation": (
-                "The references are MusicGen-Large-generated dataset audio, so this "
-                "measures similarity to that synthetic domain rather than general "
-                "recorded-music realism. The small frozen reference set also makes "
-                "the estimate noisy."
-            ),
+        implementation = {
+            "package": "torchvggish",
+            "package_version": package_version("torchvggish"),
+            "embedding": "VGGish pre-PCA without final activation",
         }
+        if uses_external_fad_references:
+            interpretation = {
+                "comparability": (
+                    "FAD values should only be compared when the same scorer, "
+                    "generated cohort, sample count, and reference corpus are used."
+                )
+            }
+            reference_sets = {
+                corpus["reference_set"] for corpus in fad_reference_corpora
+            }
+            if "human-fma-lofi-v1" in reference_sets:
+                interpretation["human-fma-lofi-v1"] = (
+                    "This is a historical FMA proxy for human-produced music; "
+                    "authorship was not independently verified."
+                )
+            if "musicgen-large-v1" in reference_sets:
+                interpretation["musicgen-large-v1"] = (
+                    "This measures similarity to a synthetic MusicGen-Large domain, "
+                    "not general musical realism."
+                )
+            metric_results["fad"] = {
+                "direction": "lower_is_better",
+                "generated_cohort": DATASET_COHORT,
+                **fad_result,
+                "implementation": implementation,
+                "interpretation": interpretation,
+            }
+        else:
+            metric_results["fad"] = {
+                "direction": "lower_is_better",
+                "cohort": DATASET_COHORT,
+                **fad_result,
+                "implementation": implementation,
+                "interpretation": (
+                    "The references are MusicGen-Large-generated dataset audio, so "
+                    "this measures similarity to that synthetic domain rather than "
+                    "general recorded-music realism. The small frozen reference set "
+                    "also makes the estimate noisy. FAD values should only be "
+                    "compared when the same scorer, generated cohort, sample count, "
+                    "and reference corpus are used."
+                ),
+            }
 
     metrics_output = {
         "schema_version": 1,
