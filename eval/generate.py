@@ -66,6 +66,12 @@ def parse_args() -> argparse.Namespace:
         help="Torch device, or 'auto' to prefer CUDA when available.",
     )
     parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=1,
+        help="Generate up to this many prompts in parallel (default: 1).",
+    )
+    parser.add_argument(
         "--limit",
         type=int,
         help="Use only the first N prompts. Intended for a distinct smoke-test run.",
@@ -174,6 +180,8 @@ def validate_args(args: argparse.Namespace, prompt_count: int) -> Path:
         raise RuntimeError("Seeds must be non-negative")
     if not args.model.strip():
         raise RuntimeError("--model cannot be empty")
+    if args.batch_size <= 0:
+        raise RuntimeError("--batch-size must be greater than zero")
 
     runs_root = RUNS_ROOT.resolve()
     output_dir = (RUNS_ROOT / args.run_name).resolve()
@@ -261,6 +269,7 @@ def build_locked_config(
         "prompt_manifest_sha256": prompt_sha256,
         "prompt_ids": [prompt["id"] for prompt in prompts],
         "seeds": args.seeds,
+        "batch_size": args.batch_size,
         "generation": GENERATION_PARAMS,
         "audio_write": AUDIO_WRITE_PARAMS,
     }
@@ -286,6 +295,20 @@ def build_clip_plan(
                 }
             )
     return plan
+
+
+def build_generation_batches(
+    clip_plan: list[dict[str, Any]], batch_size: int
+) -> list[list[dict[str, Any]]]:
+    clips_by_seed: dict[int, list[dict[str, Any]]] = {}
+    for clip in clip_plan:
+        clips_by_seed.setdefault(clip["seed"], []).append(clip)
+
+    batches = []
+    for clips in clips_by_seed.values():
+        for start in range(0, len(clips), batch_size):
+            batches.append(clips[start : start + batch_size])
+    return batches
 
 
 def write_json(path: Path, value: dict[str, Any]) -> None:
@@ -421,6 +444,16 @@ def generate(
     if not pending:
         print(f"run already complete: {len(completed)} clips in {output_dir}")
         return
+    generation_batches = build_generation_batches(clip_plan, args.batch_size)
+    pending_batches = [
+        (batch, [clip for clip in batch if clip["clip_id"] not in completed])
+        for batch in generation_batches
+    ]
+    pending_batches = [
+        (batch, pending_batch)
+        for batch, pending_batch in pending_batches
+        if pending_batch
+    ]
 
     print(f"loading {args.model} on {device}...")
     model = MusicGen.get_pretrained(model_source, device=device)
@@ -457,43 +490,66 @@ def generate(
 
     print(
         f"generating {len(pending)} of {len(clip_plan)} clips "
-        f"into {output_dir / 'audio'}"
+        f"in {len(pending_batches)} batches into {output_dir / 'audio'}"
     )
+    generated_count = 0
     with manifest_path.open("a", encoding="utf-8") as manifest_file:
-        for index, clip in enumerate(pending, start=1):
-            output_path = output_dir / clip["audio_path"]
-            if output_path.exists():
+        for batch_index, (batch, pending_batch) in enumerate(
+            pending_batches, start=1
+        ):
+            for clip in pending_batch:
+                output_path = output_dir / clip["audio_path"]
+                if output_path.exists():
+                    raise RuntimeError(
+                        f"Refusing to overwrite untracked audio file: {output_path}"
+                    )
+
+            seed = batch[0]["seed"]
+            print(
+                f"[batch {batch_index}/{len(pending_batches)}] seed {seed}: "
+                f"{len(pending_batch)} pending of {len(batch)} clips"
+            )
+            seed_everything(torch, seed, device)
+            with torch.inference_mode():
+                waveforms = model.generate(
+                    [clip["prompt"] for clip in batch], progress=True
+                )
+            if len(waveforms) != len(batch):
                 raise RuntimeError(
-                    f"Refusing to overwrite untracked audio file: {output_path}"
+                    "AudioCraft returned an unexpected number of waveforms: "
+                    f"expected {len(batch)}, got {len(waveforms)}"
                 )
 
-            print(
-                f"[{index}/{len(pending)}] {clip['prompt_id']} "
-                f"(seed {clip['seed']})"
-            )
-            seed_everything(torch, clip["seed"], device)
-            with torch.inference_mode():
-                waveform = model.generate([clip["prompt"]], progress=True)[0]
+            for clip, waveform in zip(batch, waveforms):
+                if clip["clip_id"] in completed:
+                    continue
+                output_path = output_dir / clip["audio_path"]
+                audio_write(
+                    str(output_path.with_suffix("")),
+                    waveform.cpu(),
+                    model.sample_rate,
+                    **AUDIO_WRITE_PARAMS,
+                )
+                if not output_path.is_file():
+                    raise RuntimeError(
+                        f"AudioCraft did not create expected file: {output_path}"
+                    )
 
-            audio_write(
-                str(output_path.with_suffix("")),
-                waveform.cpu(),
-                model.sample_rate,
-                **AUDIO_WRITE_PARAMS,
-            )
-            if not output_path.is_file():
-                raise RuntimeError(f"AudioCraft did not create expected file: {output_path}")
-
-            record = {
-                **clip,
-                "model_source": locked_config["model_source"],
-                "audiocraft_commit": AUDIOCRAFT_COMMIT,
-                "sample_rate": model.sample_rate,
-                "duration_seconds": GENERATION_PARAMS["duration"],
-            }
-            manifest_file.write(json.dumps(record, ensure_ascii=False) + "\n")
-            manifest_file.flush()
-            os.fsync(manifest_file.fileno())
+                record = {
+                    **clip,
+                    "model_source": locked_config["model_source"],
+                    "audiocraft_commit": AUDIOCRAFT_COMMIT,
+                    "sample_rate": model.sample_rate,
+                    "duration_seconds": GENERATION_PARAMS["duration"],
+                }
+                manifest_file.write(json.dumps(record, ensure_ascii=False) + "\n")
+                manifest_file.flush()
+                os.fsync(manifest_file.fileno())
+                generated_count += 1
+                print(
+                    f"[{generated_count}/{len(pending)}] {clip['prompt_id']} "
+                    f"(seed {clip['seed']})"
+                )
 
     print(f"run complete: {len(clip_plan)} clips in {output_dir}")
 

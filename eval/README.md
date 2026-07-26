@@ -138,6 +138,11 @@ The run generates all 30 prompts with the default seeds 42, 43, 44, and 45 for
 temperature 1.0, top-k 250, top-p disabled, and WAV loudness normalization.
 Outputs are written to `runs/baseline_musicgen_small/`.
 
+Generation defaults to one clip at a time. To use accelerator parallelism, add
+`--batch-size N`. Each batch contains up to `N` prompts sharing the same seed;
+the batch size is locked in the run configuration, so use the same value for
+baseline and fine-tuned runs. Lower it if generation runs out of device memory.
+
 ## Generate a fine-tuned checkpoint run
 
 Keep Dora checkpoint export separate from audio generation. After training,
