@@ -3,6 +3,7 @@ from datetime import datetime, timezone
 import hashlib
 from importlib import metadata
 import json
+import math
 import os
 from pathlib import Path
 import platform
@@ -18,7 +19,7 @@ CHECKSUM_PATH = EVAL_DIR / "prompts.sha256"
 RUNS_ROOT = PROJECT_ROOT / "runs"
 
 AUDIOCRAFT_COMMIT = "adf0b04a4452f171970028fcf80f101dd5e26e19"
-GENERATION_PARAMS = {
+DEFAULT_GENERATION_PARAMS = {
     "duration": 30,
     "use_sampling": True,
     "top_k": 250,
@@ -70,6 +71,12 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=1,
         help="Generate up to this many prompts in parallel (default: 1).",
+    )
+    parser.add_argument(
+        "--cfg-coef",
+        type=float,
+        default=DEFAULT_GENERATION_PARAMS["cfg_coef"],
+        help="Classifier-free guidance coefficient (default: 3.0).",
     )
     parser.add_argument(
         "--limit",
@@ -182,12 +189,21 @@ def validate_args(args: argparse.Namespace, prompt_count: int) -> Path:
         raise RuntimeError("--model cannot be empty")
     if args.batch_size <= 0:
         raise RuntimeError("--batch-size must be greater than zero")
+    if not math.isfinite(args.cfg_coef) or args.cfg_coef <= 0:
+        raise RuntimeError("--cfg-coef must be a finite positive number")
 
     runs_root = RUNS_ROOT.resolve()
     output_dir = (RUNS_ROOT / args.run_name).resolve()
     if output_dir.parent != runs_root:
         raise RuntimeError(f"--run-name escapes the runs directory: {args.run_name!r}")
     return output_dir
+
+
+def generation_params(cfg_coef: float) -> dict[str, Any]:
+    return {
+        **DEFAULT_GENERATION_PARAMS,
+        "cfg_coef": cfg_coef,
+    }
 
 
 def model_package_digest(directory: Path) -> tuple[str, int]:
@@ -270,7 +286,7 @@ def build_locked_config(
         "prompt_ids": [prompt["id"] for prompt in prompts],
         "seeds": args.seeds,
         "batch_size": args.batch_size,
-        "generation": GENERATION_PARAMS,
+        "generation": generation_params(args.cfg_coef),
         "audio_write": AUDIO_WRITE_PARAMS,
     }
 
@@ -388,7 +404,7 @@ def validate_completed_clips(
             **planned[clip_id],
             "model_source": locked_config["model_source"],
             "audiocraft_commit": AUDIOCRAFT_COMMIT,
-            "duration_seconds": GENERATION_PARAMS["duration"],
+            "duration_seconds": locked_config["generation"]["duration"],
         }
         for key, value in expected.items():
             if record.get(key) != value:
@@ -457,7 +473,7 @@ def generate(
 
     print(f"loading {args.model} on {device}...")
     model = MusicGen.get_pretrained(model_source, device=device)
-    model.set_generation_params(**GENERATION_PARAMS)
+    model.set_generation_params(**locked_config["generation"])
 
     runtime_path = output_dir / "runtime.json"
     runtime = {
@@ -540,7 +556,7 @@ def generate(
                     "model_source": locked_config["model_source"],
                     "audiocraft_commit": AUDIOCRAFT_COMMIT,
                     "sample_rate": model.sample_rate,
-                    "duration_seconds": GENERATION_PARAMS["duration"],
+                    "duration_seconds": locked_config["generation"]["duration"],
                 }
                 manifest_file.write(json.dumps(record, ensure_ascii=False) + "\n")
                 manifest_file.flush()
