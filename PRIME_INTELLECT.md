@@ -101,6 +101,28 @@ generation for both pretrained model IDs and exported package directories.
 The fine-tuned example writes to the distinct
 `/workspace/runs/finetuned_infinifi` run directory.
 
+To compare periodic epoch checkpoints, export each one to a separate package.
+`--checkpoint` accepts a positive epoch number; omitting it, or passing
+`latest`, exports `checkpoint.th`:
+
+```bash
+python export_checkpoint.py \
+  --signature "$DORA_SIGNATURE" \
+  --checkpoint 1 \
+  --output-dir /checkpoints/infinifi-epoch1
+```
+
+Generation uses classifier-free guidance coefficient 3.0 by default. Give
+every alternate coefficient a distinct run name because the value is locked
+into the run configuration:
+
+```bash
+python eval/generate.py \
+  --model /checkpoints/infinifi-epoch1 \
+  --run-name finetuned_infinifi_epoch1_cfg4 \
+  --cfg-coef 4
+```
+
 ### Fine-tuning
 
 `train.sh` fine-tunes the pretrained `facebook/musicgen-small` model on the
