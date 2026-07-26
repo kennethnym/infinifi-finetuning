@@ -71,12 +71,47 @@ class EvalGenerateTest(unittest.TestCase):
             seeds=[42],
             model="model",
             batch_size=0,
+            cfg_coef=3.0,
         )
 
         with self.assertRaisesRegex(
             RuntimeError, "--batch-size must be greater than zero"
         ):
             generate.validate_args(args, prompt_count=1)
+
+    def test_rejects_invalid_cfg_coefficient(self) -> None:
+        args = SimpleNamespace(
+            run_name="test-run",
+            limit=None,
+            seeds=[42],
+            model="model",
+            batch_size=1,
+            cfg_coef=float("inf"),
+        )
+
+        with self.assertRaisesRegex(
+            RuntimeError, "--cfg-coef must be a finite positive number"
+        ):
+            generate.validate_args(args, prompt_count=1)
+
+    def test_locks_requested_cfg_coefficient(self) -> None:
+        args = SimpleNamespace(
+            run_name="test-run",
+            seeds=[42],
+            batch_size=1,
+            cfg_coef=5.0,
+        )
+
+        with mock.patch.object(generate, "sha256_file", return_value="digest"):
+            config = generate.build_locked_config(
+                args,
+                [{"id": "prompt-0"}],
+                "prompt-digest",
+                {"type": "pretrained", "model_id": "test-model"},
+            )
+
+        self.assertEqual(config["generation"]["cfg_coef"], 5.0)
+        self.assertEqual(generate.DEFAULT_GENERATION_PARAMS["cfg_coef"], 3.0)
 
     def test_generates_prompts_in_batches(self) -> None:
         prompts = [
@@ -91,6 +126,7 @@ class EvalGenerateTest(unittest.TestCase):
         )
         locked_config = {
             "model_source": {"type": "pretrained", "model_id": "test-model"},
+            "generation": generate.generation_params(4.0),
         }
         fake_model = FakeModel()
         seeded = []
@@ -189,6 +225,7 @@ class EvalGenerateTest(unittest.TestCase):
             ],
         )
         self.assertEqual(initial_seeded, [42, 42, 43, 43])
+        self.assertEqual(fake_model.generation_params["cfg_coef"], 4.0)
         self.assertEqual(resumed_calls, [["Prompt 0", "Prompt 1"]])
         self.assertEqual(seeded, [42])
         self.assertEqual(len(resumed_records), 6)

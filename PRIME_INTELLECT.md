@@ -183,6 +183,28 @@ leave the previous final dataset intact. CLAP is a caption/audio filtering
 signal, not a complete measure of musical quality, production quality, or
 dataset suitability.
 
+To compare periodic epoch checkpoints, export each one to a separate package.
+`--checkpoint` accepts a positive epoch number; omitting it, or passing
+`latest`, exports `checkpoint.th`:
+
+```bash
+python export_checkpoint.py \
+  --signature "$DORA_SIGNATURE" \
+  --checkpoint 1 \
+  --output-dir /checkpoints/infinifi-epoch1
+```
+
+Generation uses classifier-free guidance coefficient 3.0 by default. Give
+every alternate coefficient a distinct run name because the value is locked
+into the run configuration:
+
+```bash
+python eval/generate.py \
+  --model /checkpoints/infinifi-epoch1 \
+  --run-name finetuned_infinifi_epoch1_cfg4 \
+  --cfg-coef 4
+```
+
 ### Fine-tuning
 
 `train.sh` fine-tunes the pretrained `facebook/musicgen-small` model on the
