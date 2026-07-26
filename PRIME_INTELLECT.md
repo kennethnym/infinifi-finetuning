@@ -73,7 +73,11 @@ python eval/prepare_references.py --dry-run
 python eval/prepare_references.py
 python eval/generate.py --model facebook/musicgen-small --run-name baseline_musicgen_small --dry-run
 python eval/generate.py --model facebook/musicgen-small --run-name baseline_musicgen_small
-BATCH_COUNT=1 python prepare.py
+python prepare.py \
+  --candidate-count 20000 \
+  --train-count 6000 \
+  --valid-count 750 \
+  --clap-batch-size 32
 bash train.sh \
   --epochs 1 \
   --updates-per-epoch 10 \
@@ -91,8 +95,8 @@ Run the baseline generator before fine-tuning. It writes the plain
 `facebook/musicgen-small` WAVs and reproducibility manifests under
 `/workspace/runs/baseline_musicgen_small`.
 
-Increase `BATCH_COUNT` after the one-batch preparation test succeeds.
-`prepare.py` writes its dataset and manifests under `/workspace/audiocraft`.
+`prepare.py` writes its selected dataset and manifests under
+`/workspace/audiocraft`.
 AudioCraft/Dora writes training runs according to its default grid and cache
 configuration. After training, pass the Dora signature to
 `export_checkpoint.py`. Exporting only packages the LM and pinned
@@ -100,6 +104,84 @@ configuration. After training, pass the Dora signature to
 generation for both pretrained model IDs and exported package directories.
 The fine-tuned example writes to the distinct
 `/workspace/runs/finetuned_infinifi` run directory.
+
+### Dataset curation
+
+The complete preparation command streams the pinned `vikhyatk/lofi` revision,
+caches 20,000 eligible unique candidates, scores their exact caption/audio
+pairs with the pinned LAION-CLAP music checkpoint, and selects exactly 6,000
+training plus 750 validation tracks:
+
+```bash
+python prepare.py \
+  --candidate-count 20000 \
+  --train-count 6000 \
+  --valid-count 750 \
+  --clap-batch-size 32
+```
+
+For a small end-to-end smoke test, use a separate cache so its locked
+candidate count does not conflict with the full run:
+
+```bash
+python prepare.py \
+  --candidate-count 128 \
+  --train-count 64 \
+  --valid-count 16 \
+  --clap-batch-size 8 \
+  --cache-dir /workspace/curation-smoke
+```
+
+The persistent cache defaults to `/workspace/curation`. Candidate MP3s are
+written once, their SHA-256 digests are verified on every reuse, and completed
+CLAP batches are journaled. Re-running the same command resumes collection or
+scoring without downloading or scoring completed valid records. `config.json`
+locks the source revision, candidate count, split rules, ignored words, and
+CLAP and deduplication identities. If any locked input changes, use a different
+`--cache-dir` or deliberately remove the old cache instead of mixing runs. You
+may supply the pinned checkpoint locally with `--clap-checkpoint PATH`; its
+frozen SHA-256 is still validated.
+
+To manually reject or rewrite captions, create
+`/workspace/curation/overrides.jsonl`, or pass another file with
+`--overrides PATH`. IDs must be unique and belong to the cached candidate
+pool:
+
+```jsonl
+{"id":"track-123","action":"drop","reason":"caption/audio mismatch"}
+{"id":"track-456","action":"rewrite","caption":"mellow piano lo-fi with soft vinyl crackle","reason":"manually audited"}
+```
+
+Drop reasons remain in the audit trail. Rewrites are never generated
+automatically: their new caption is rescored, and the effective caption is
+used in the final AudioCraft metadata.
+
+Before ranking, preparation removes duplicate audio hashes, exact normalized
+captions, and near-identical captions. Near-caption matching uses a
+deterministic lexical similarity threshold of `0.90` after punctuation and
+whitespace normalization, with efficient one-token-edit candidate matching.
+The highest effective CLAP score is retained, with track ID breaking ties.
+This catches small wording edits, pluralization, punctuation, and many typos;
+it is intentionally not semantic embedding similarity.
+
+The cache contains these reproducibility and audit artifacts:
+
+- `config.json`: locked dataset, split, schema, and CLAP provenance.
+- `candidates.jsonl` and `audio/`: source order, captions, split assignments,
+  original MP3s, and audio hashes.
+- `scores.jsonl`: original/effective captions and their CLAP scores, including
+  invalid-audio reasons.
+- `selection.jsonl`: every candidate's rank, inclusion or rejection decision,
+  override, retained duplicate ID, and audio hash.
+- `summary.json`: exact counts, exclusions, deduplication totals, score
+  statistics, provenance, and the deterministic `selection.jsonl` digest.
+
+Only selected tracks go through KeyBERT and materialization. Preparation first
+builds and validates a staging dataset and exact manifests, then replaces
+`audiocraft/dataset/lofi`; collection, scoring, selection, or staging failures
+leave the previous final dataset intact. CLAP is a caption/audio filtering
+signal, not a complete measure of musical quality, production quality, or
+dataset suitability.
 
 ### Fine-tuning
 
@@ -112,10 +194,10 @@ using 20-second segments and a batch size of two:
 bash train.sh
 ```
 
-Run the default training configuration only after increasing `BATCH_COUNT` and
-preparing a meaningfully sized dataset. The short invocation in the pipeline
-example is an end-to-end smoke test; it is not intended to produce a
-quality-ready checkpoint.
+Run the default training configuration only after preparing a meaningfully
+sized dataset. The short training invocation in the pipeline example is an
+end-to-end smoke test; it is not intended to produce a quality-ready
+checkpoint.
 
 Pass command-line options to change the training budget and memory-sensitive
 settings without editing the script:
