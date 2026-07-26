@@ -144,10 +144,11 @@ Reference preparation downloads two 500-track corpora under
 the corpora must survive pod deletion. The software is MIT-licensed, but the
 downloaded reference audio retains its source Creative Commons licenses and
 includes non-commercial tracks. See `eval/README.md` for the exact source
-revisions, selection rules, attribution files, and current scorer limitation.
+revisions, selection rules, and attribution files.
 
-After increasing `BATCH_COUNT` enough for `prepare.py` to materialize all
-twenty frozen `dataset_eval` references, score both generated corpora:
+The prepared `musicgen-large-v1` corpus contains all twenty paired
+`dataset_eval` references required by KLD. Score both generated corpora after
+reference preparation and generation complete:
 
 ```bash
 python eval/score.py --run-name baseline_musicgen_small --dry-run

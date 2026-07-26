@@ -15,7 +15,7 @@ from typing import Any
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 RUNS_ROOT = PROJECT_ROOT / "runs"
-DEFAULT_REFERENCE_DIR = PROJECT_ROOT / "audiocraft" / "dataset" / "lofi" / "eval"
+DEFAULT_REFERENCE_DIR = PROJECT_ROOT / "references" / "musicgen-large-v1"
 DEFAULT_FAD_REFERENCE_CORPORA = (
     PROJECT_ROOT / "references" / "human-fma-lofi-v1",
     PROJECT_ROOT / "references" / "musicgen-large-v1",
@@ -58,8 +58,9 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         default=DEFAULT_REFERENCE_DIR,
         help=(
-            "Prepared paired held-out audio directory used by KLD; defaults to "
-            "audiocraft/dataset/lofi/eval."
+            "Prepared MusicGen-Large reference corpus used by KLD. Legacy "
+            "AudioCraft eval sidecar directories are also accepted. Defaults "
+            "to references/musicgen-large-v1."
         ),
     )
     parser.add_argument(
@@ -461,17 +462,10 @@ def validate_dataset_eval_cohort(
     return expected_prompts
 
 
-def load_references(
+def load_legacy_references(
     reference_dir: Path,
     records: list[dict[str, Any]],
 ) -> dict[str, dict[str, Any]]:
-    reference_dir = reference_dir.expanduser().resolve()
-    if not reference_dir.is_dir():
-        raise RuntimeError(
-            f"Held-out reference directory not found: {reference_dir}. "
-            "Run prepare.py with enough batches to include the frozen dataset_eval IDs."
-        )
-
     expected_prompts = validate_dataset_eval_cohort(records)
 
     references = {}
@@ -494,52 +488,57 @@ def load_references(
             "audio_path": audio_path,
             "display_path": display_path(audio_path),
             "sha256": sha256_file(audio_path),
+            "format": "audiocraft_sidecar",
         }
 
     missing = sorted(set(expected_prompts) - set(references))
     if missing:
         raise RuntimeError(
-            "Prepared eval data is missing frozen references for source IDs: "
+            "Legacy AudioCraft eval data is missing frozen references for source IDs: "
             + ", ".join(missing)
         )
     return references
 
 
-def resolve_fad_reference_audio(corpus_dir: Path, relative_path: Any) -> Path:
+def resolve_reference_corpus_audio(corpus_dir: Path, relative_path: Any) -> Path:
     if not isinstance(relative_path, str) or not relative_path:
-        raise RuntimeError("FAD reference manifest contains an invalid audio_path")
+        raise RuntimeError("Reference corpus manifest contains an invalid audio_path")
     supplied = Path(relative_path)
     if supplied.is_absolute():
-        raise RuntimeError(f"FAD reference audio_path must be relative: {relative_path}")
+        raise RuntimeError(
+            f"Reference corpus audio_path must be relative: {relative_path}"
+        )
     if ".." in supplied.parts:
         raise RuntimeError(
-            f"FAD reference audio_path contains traversal: {relative_path}"
+            f"Reference corpus audio_path contains traversal: {relative_path}"
         )
 
     candidate = corpus_dir
     for part in supplied.parts:
         candidate = candidate / part
         if candidate.is_symlink():
-            raise RuntimeError(f"FAD reference audio cannot use symlinks: {candidate}")
+            raise RuntimeError(
+                f"Reference corpus audio cannot use symlinks: {candidate}"
+            )
 
     resolved = candidate.resolve()
     try:
         resolved.relative_to(corpus_dir)
     except ValueError as error:
         raise RuntimeError(
-            f"FAD reference audio_path escapes its corpus: {relative_path}"
+            f"Reference corpus audio_path escapes its corpus: {relative_path}"
         ) from error
     if not resolved.is_file():
         raise RuntimeError(
-            f"FAD reference audio is missing or not a regular file: {resolved}"
+            f"Reference corpus audio is missing or not a regular file: {resolved}"
         )
     return resolved
 
 
-def validate_fad_reference_corpus(path: Path) -> dict[str, Any]:
+def validate_reference_corpus(path: Path) -> dict[str, Any]:
     supplied_path = path.expanduser()
     if not supplied_path.is_dir():
-        raise RuntimeError(f"FAD reference corpus directory not found: {supplied_path}")
+        raise RuntimeError(f"Reference corpus directory not found: {supplied_path}")
     corpus_dir = supplied_path.resolve()
     config_path = corpus_dir / "config.json"
     manifest_path = corpus_dir / "manifest.jsonl"
@@ -549,7 +548,7 @@ def validate_fad_reference_corpus(path: Path) -> dict[str, Any]:
     config = read_json(config_path)
     if config.get("schema_version") != 1:
         raise RuntimeError(
-            f"Unsupported FAD reference corpus schema in {config_path}: "
+            f"Unsupported reference corpus schema in {config_path}: "
             f"{config.get('schema_version')!r}"
         )
     reference_set = config.get("reference_set")
@@ -567,7 +566,7 @@ def validate_fad_reference_corpus(path: Path) -> dict[str, Any]:
         checksum_lines = checksum_path.read_text(encoding="utf-8").splitlines()
     except FileNotFoundError as error:
         raise RuntimeError(
-            f"FAD reference checksum file not found: {checksum_path}"
+            f"Reference corpus checksum file not found: {checksum_path}"
         ) from error
     expected_hashes = {}
     for line in checksum_lines:
@@ -577,26 +576,28 @@ def validate_fad_reference_corpus(path: Path) -> dict[str, Any]:
             or re.fullmatch(r"[0-9a-fA-F]{64}", parts[0]) is None
             or parts[1] in expected_hashes
         ):
-            raise RuntimeError(f"Invalid FAD reference checksum line: {line!r}")
+            raise RuntimeError(f"Invalid reference corpus checksum line: {line!r}")
         expected_hashes[parts[1]] = parts[0].lower()
     if set(expected_hashes) != {"manifest.jsonl", "ATTRIBUTION.md"}:
-        raise RuntimeError(f"Invalid FAD reference checksum file: {checksum_path}")
+        raise RuntimeError(f"Invalid reference corpus checksum file: {checksum_path}")
 
     if not manifest_path.is_file():
-        raise RuntimeError(f"FAD reference manifest not found: {manifest_path}")
+        raise RuntimeError(f"Reference corpus manifest not found: {manifest_path}")
     if not attribution_path.is_file():
-        raise RuntimeError(f"FAD reference attribution not found: {attribution_path}")
+        raise RuntimeError(
+            f"Reference corpus attribution not found: {attribution_path}"
+        )
     actual_manifest_sha256 = sha256_file(manifest_path)
     if actual_manifest_sha256 != expected_hashes["manifest.jsonl"]:
         raise RuntimeError(
-            f"FAD reference manifest checksum mismatch in {corpus_dir}: "
+            f"Reference corpus manifest checksum mismatch in {corpus_dir}: "
             f"expected {expected_hashes['manifest.jsonl']}, "
             f"got {actual_manifest_sha256}"
         )
     actual_attribution_sha256 = sha256_file(attribution_path)
     if actual_attribution_sha256 != expected_hashes["ATTRIBUTION.md"]:
         raise RuntimeError(
-            f"FAD reference attribution checksum mismatch in {corpus_dir}: "
+            f"Reference corpus attribution checksum mismatch in {corpus_dir}: "
             f"expected {expected_hashes['ATTRIBUTION.md']}, "
             f"got {actual_attribution_sha256}"
         )
@@ -604,7 +605,7 @@ def validate_fad_reference_corpus(path: Path) -> dict[str, Any]:
     records = read_jsonl(manifest_path)
     if len(records) != target_count:
         raise RuntimeError(
-            f"Expected {target_count} FAD references in {reference_set}, "
+            f"Expected {target_count} references in {reference_set}, "
             f"found {len(records)}"
         )
 
@@ -619,17 +620,21 @@ def validate_fad_reference_corpus(path: Path) -> dict[str, Any]:
             or reference_id in seen_ids
         ):
             raise RuntimeError(
-                f"Duplicate or invalid FAD reference_id: {reference_id!r}"
+                f"Duplicate or invalid reference_id: {reference_id!r}"
             )
         if record.get("reference_set") != reference_set:
-            raise RuntimeError(f"FAD reference_set mismatch for {reference_id}")
-        audio_path = resolve_fad_reference_audio(
+            raise RuntimeError(
+                f"Reference corpus reference_set mismatch for {reference_id}"
+            )
+        audio_path = resolve_reference_corpus_audio(
             corpus_dir,
             record.get("audio_path"),
         )
         actual_audio_sha256 = sha256_file(audio_path)
         if record.get("audio_sha256") != actual_audio_sha256:
-            raise RuntimeError(f"FAD reference audio checksum mismatch: {audio_path}")
+            raise RuntimeError(
+                f"Reference corpus audio checksum mismatch: {audio_path}"
+            )
         seen_ids.add(reference_id)
         audio_paths.append(audio_path)
         audio_fingerprints[reference_id] = actual_audio_sha256
@@ -648,11 +653,15 @@ def validate_fad_reference_corpus(path: Path) -> dict[str, Any]:
     }
 
 
+def validate_fad_reference_corpus(path: Path) -> dict[str, Any]:
+    return validate_reference_corpus(path)
+
+
 def validate_fad_reference_corpora(paths: list[Path]) -> list[dict[str, Any]]:
     corpora = []
     by_reference_set = {}
     for path in paths:
-        corpus = validate_fad_reference_corpus(path)
+        corpus = validate_reference_corpus(path)
         reference_set = corpus["reference_set"]
         if reference_set in by_reference_set:
             raise RuntimeError(
@@ -663,6 +672,97 @@ def validate_fad_reference_corpora(paths: list[Path]) -> list[dict[str, Any]]:
         by_reference_set[reference_set] = corpus["path"]
         corpora.append(corpus)
     return corpora
+
+
+def load_references_from_corpus(
+    corpus: dict[str, Any],
+    records: list[dict[str, Any]],
+) -> dict[str, dict[str, Any]]:
+    if corpus.get("reference_set") != "musicgen-large-v1":
+        raise RuntimeError(
+            "Paired KLD references require the musicgen-large-v1 reference corpus, "
+            f"got {corpus.get('reference_set')!r}"
+        )
+
+    expected_prompts = validate_dataset_eval_cohort(records)
+    corpus_records = corpus.get("records")
+    audio_paths = corpus.get("audio_paths")
+    if (
+        not isinstance(corpus_records, list)
+        or not isinstance(audio_paths, list)
+        or len(corpus_records) != len(audio_paths)
+    ):
+        raise RuntimeError("Validated reference corpus has inconsistent records")
+
+    references = {}
+    for record, audio_path in zip(corpus_records, audio_paths):
+        source_id = record.get("source_id")
+        if not isinstance(source_id, str) or not source_id:
+            raise RuntimeError(
+                f"MusicGen-Large reference has an invalid source_id: "
+                f"{record.get('reference_id')!r}"
+            )
+        if source_id not in expected_prompts:
+            continue
+        if source_id in references:
+            raise RuntimeError(
+                f"Duplicate paired reference for source {source_id}"
+            )
+        prompt = record.get("prompt")
+        if prompt != expected_prompts[source_id]:
+            raise RuntimeError(
+                f"Reference prompt mismatch for {source_id}: "
+                f"{prompt!r} != {expected_prompts[source_id]!r}"
+            )
+        references[source_id] = {
+            "source_id": source_id,
+            "audio_path": audio_path,
+            "display_path": display_path(audio_path),
+            "sha256": record["audio_sha256"],
+            "format": "reference_corpus_manifest",
+        }
+
+    missing = sorted(set(expected_prompts) - set(references))
+    if missing:
+        raise RuntimeError(
+            "MusicGen-Large reference corpus is missing frozen paired references "
+            "for source IDs: " + ", ".join(missing)
+        )
+    return references
+
+
+def load_references(
+    reference_dir: Path,
+    records: list[dict[str, Any]],
+    validated_corpus: dict[str, Any] | None = None,
+) -> dict[str, dict[str, Any]]:
+    reference_dir = reference_dir.expanduser().resolve()
+    if not reference_dir.is_dir():
+        raise RuntimeError(
+            f"Held-out reference directory not found: {reference_dir}. "
+            "Run eval/prepare_references.py with musicgen-large-v1 enabled."
+        )
+
+    if validated_corpus is not None:
+        if validated_corpus.get("path") != reference_dir:
+            raise RuntimeError(
+                "Validated paired reference corpus path does not match "
+                f"--reference-dir: {validated_corpus.get('path')} != {reference_dir}"
+            )
+        return load_references_from_corpus(validated_corpus, records)
+
+    corpus_markers = (
+        "config.json",
+        "manifest.jsonl",
+        "manifest.sha256",
+        "ATTRIBUTION.md",
+    )
+    if any((reference_dir / name).exists() for name in corpus_markers):
+        return load_references_from_corpus(
+            validate_reference_corpus(reference_dir),
+            records,
+        )
+    return load_legacy_references(reference_dir, records)
 
 
 def package_version(package: str) -> str | None:
@@ -1507,8 +1607,23 @@ def main() -> None:
     needs_references = "kld" in metrics or (
         "fad" in metrics and not uses_external_fad_references
     )
+    resolved_reference_dir = args.reference_dir.expanduser().resolve()
+    validated_paired_corpus = next(
+        (
+            corpus
+            for corpus in fad_reference_corpora
+            if corpus["path"] == resolved_reference_dir
+        ),
+        None,
+    )
     references = (
-        load_references(args.reference_dir, records) if needs_references else {}
+        load_references(
+            args.reference_dir,
+            records,
+            validated_paired_corpus,
+        )
+        if needs_references
+        else {}
     )
     if (
         "fad" in metrics

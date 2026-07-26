@@ -39,13 +39,13 @@ domain, not general realism against recorded music.
 The expected SHA-256 digest of `prompts.jsonl` is recorded in
 `prompts.sha256`.
 
-## Prepare FAD reference corpora
+## Prepare evaluation reference corpora
 
-`prepare_references.py` builds two frozen, 500-track corpora:
+`prepare_references.py` builds two frozen, 500-track evaluation corpora:
 
-- `musicgen-large-v1` contains the twenty existing paired references plus 480
+- `musicgen-large-v1` contains the twenty paired KLD references plus 480
   additional tracks from the deterministic held-out portion of
-  `vikhyatk/lofi`.
+  `vikhyatk/lofi`; the complete corpus is also used for FAD.
 - `human-fma-lofi-v1` contains human-produced tracks with the exact FMA
   `Lo-Fi` genre. It accepts only CC-BY 3.0/4.0 and CC-BY-NC 3.0/4.0 tracks,
   rejects NoDerivatives and ShareAlike licenses, and selects tracks with a
@@ -209,14 +209,21 @@ The scorer computes:
 - CLAP seed diversity by comparing every unordered pair of seeds for the same
   prompt and then giving every prompt equal weight in the overall result.
 - PaSST KLD for `dataset_eval`, pairing every generated clip with the held-out
-  source audio identified by `source_id`.
+  MusicGen-Large source audio identified by `source_id`.
 - VGGish FAD for generated `dataset_eval` clips against each default or
   explicitly supplied distribution-level reference corpus.
 
-KLD references are loaded from `audiocraft/dataset/lofi/eval`. Pass
-`--reference-dir` if that paired data is stored elsewhere. All twenty frozen
-`dataset_eval` source IDs must be present; increase `BATCH_COUNT` and rerun
-`prepare.py` if the scorer reports missing paired references.
+KLD selects the twenty frozen, prompt-matched records from
+`references/musicgen-large-v1/manifest.jsonl`. The scorer validates the corpus
+manifest, attribution, and every audio hash before using those records. Pass
+`--reference-dir` if the prepared corpus is stored elsewhere. For backward
+compatibility, the option also accepts the old flat
+`audiocraft/dataset/lofi/eval` sidecar format.
+
+This KLD measures paired similarity to the held-out synthetic dataset domain.
+It does not independently measure musical quality, human realism, or prompt
+adherence. The twenty source tracks remain the independent reference
+population even when several generation seeds are scored against each source.
 
 FAD defaults to both frozen 500-track distribution-level corpora:
 
