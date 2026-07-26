@@ -8,18 +8,30 @@ Usage: train.sh [options]
 Fine-tune facebook/musicgen-small on the prepared lo-fi dataset.
 
 Options:
-  --batch-size N           Batch size per GPU (default: 2)
-  --epochs N               Number of epochs (default: 10)
-  --updates-per-epoch N    Optimizer updates per epoch (default: 500)
-  --segment-duration SEC   Training segment duration (default: 20)
-  --num-workers N          Data-loader workers (default: 4)
-  --lr RATE                AdamW learning rate (default: 1e-5)
-  --warmup-steps N         Cosine warmup updates (default: 5% of all updates)
-  --train-samples N        Samples per epoch (default: batch size x updates)
-  --valid-samples N        Validation samples per epoch (default: 128)
-  --evaluate-samples N     Evaluation samples (default: 128)
-  --generate-samples N     Generated monitoring samples (default: 4)
-  -h, --help               Show this help
+  --batch-size N          Batch size per GPU (default: 2)
+  --epochs N              Number of epochs (default: 10)
+  --updates-per-epoch N   Optimizer updates per epoch (default: 500)
+  --segment-duration SEC  Training segment duration (default: 20)
+  --num-workers N         Data-loader workers (default: 4)
+  --lr RATE               AdamW learning rate (default: 1e-5)
+  --warmup-steps N        Cosine warmup updates (default: 5% of all updates)
+  --train-samples N       Samples per epoch (default: batch size x updates)
+  --valid-samples N       Validation samples per epoch (default: 128)
+  --evaluate-samples N    Evaluation samples (default: 128)
+  --generate-samples N    Generated monitoring samples (default: 4)
+  --generate-every N      Generate monitoring samples every N epochs (default: 5)
+  --checkpoint-every N    Save a checkpoint every N epochs (default: 5)
+  --word-dropout RATE     T5 word-dropout probability in [0, 1]
+                           (default: AudioCraft configuration)
+  --cfg-dropout RATE      Classifier-free training dropout in [0, 1]
+                           (default: AudioCraft configuration)
+  --merge-text-p RATE     Metadata-merge probability in [0, 1]
+                           (default: AudioCraft configuration)
+  --drop-desc-p RATE      Description-drop probability on merge in [0, 1]
+                           (default: AudioCraft configuration)
+  --drop-other-p RATE     Metadata-field dropout probability in [0, 1]
+                           (default: AudioCraft configuration)
+  -h, --help              Show this help
 EOF
 }
 
@@ -59,6 +71,13 @@ require_positive_number() {
     fail "${option} must be a positive number"
 }
 
+require_probability() {
+    local option="$1"
+    local value="$2"
+    [[ "$value" =~ ^(0([.][0-9]*)?|[.][0-9]+|1([.]0*)?)$ ]] ||
+        fail "${option} must be a number between 0 and 1"
+}
+
 finetune_batch_size=2
 finetune_epochs=10
 finetune_updates_per_epoch=500
@@ -70,6 +89,13 @@ finetune_train_samples=
 finetune_valid_samples=128
 finetune_evaluate_samples=128
 finetune_generate_samples=4
+finetune_generate_every=5
+finetune_checkpoint_every=5
+finetune_word_dropout=
+finetune_cfg_dropout=
+finetune_merge_text_p=
+finetune_drop_desc_p=
+finetune_drop_other_p=
 
 while (( $# > 0 )); do
     case "$1" in
@@ -128,6 +154,41 @@ while (( $# > 0 )); do
             finetune_generate_samples="$2"
             shift 2
             ;;
+        --generate-every)
+            require_option_value "$@"
+            finetune_generate_every="$2"
+            shift 2
+            ;;
+        --checkpoint-every)
+            require_option_value "$@"
+            finetune_checkpoint_every="$2"
+            shift 2
+            ;;
+        --word-dropout)
+            require_option_value "$@"
+            finetune_word_dropout="$2"
+            shift 2
+            ;;
+        --cfg-dropout)
+            require_option_value "$@"
+            finetune_cfg_dropout="$2"
+            shift 2
+            ;;
+        --merge-text-p)
+            require_option_value "$@"
+            finetune_merge_text_p="$2"
+            shift 2
+            ;;
+        --drop-desc-p)
+            require_option_value "$@"
+            finetune_drop_desc_p="$2"
+            shift 2
+            ;;
+        --drop-other-p)
+            require_option_value "$@"
+            finetune_drop_other_p="$2"
+            shift 2
+            ;;
         -h|--help)
             usage
             exit 0
@@ -147,6 +208,24 @@ require_positive_number --lr "$finetune_lr"
 require_positive_integer --valid-samples "$finetune_valid_samples"
 require_positive_integer --evaluate-samples "$finetune_evaluate_samples"
 require_positive_integer --generate-samples "$finetune_generate_samples"
+require_positive_integer --generate-every "$finetune_generate_every"
+require_positive_integer --checkpoint-every "$finetune_checkpoint_every"
+
+if [[ -n "$finetune_word_dropout" ]]; then
+    require_probability --word-dropout "$finetune_word_dropout"
+fi
+if [[ -n "$finetune_cfg_dropout" ]]; then
+    require_probability --cfg-dropout "$finetune_cfg_dropout"
+fi
+if [[ -n "$finetune_merge_text_p" ]]; then
+    require_probability --merge-text-p "$finetune_merge_text_p"
+fi
+if [[ -n "$finetune_drop_desc_p" ]]; then
+    require_probability --drop-desc-p "$finetune_drop_desc_p"
+fi
+if [[ -n "$finetune_drop_other_p" ]]; then
+    require_probability --drop-other-p "$finetune_drop_other_p"
+fi
 
 finetune_total_updates=$((finetune_epochs * finetune_updates_per_epoch))
 if [[ -z "$finetune_warmup_steps" ]]; then
@@ -179,7 +258,7 @@ dora_args=(
     "dataset.valid.num_samples=${finetune_valid_samples}"
     "dataset.evaluate.num_samples=${finetune_evaluate_samples}"
     "dataset.generate.num_samples=${finetune_generate_samples}"
-    generate.every=5
+    "generate.every=${finetune_generate_every}"
     generate.lm.prompted_samples=false
     "optim.epochs=${finetune_epochs}"
     "optim.updates_per_epoch=${finetune_updates_per_epoch}"
@@ -193,7 +272,27 @@ dora_args=(
     schedule.lr_scheduler=cosine
     "schedule.cosine.warmup=${finetune_warmup_steps}"
     schedule.cosine.lr_min_ratio=0.1
-    checkpoint.save_every=5
+    "checkpoint.save_every=${finetune_checkpoint_every}"
 )
+
+if [[ -n "$finetune_word_dropout" ]]; then
+    dora_args+=(
+        "conditioners.description.t5.word_dropout=${finetune_word_dropout}"
+    )
+fi
+if [[ -n "$finetune_cfg_dropout" ]]; then
+    dora_args+=(
+        "classifier_free_guidance.training_dropout=${finetune_cfg_dropout}"
+    )
+fi
+if [[ -n "$finetune_merge_text_p" ]]; then
+    dora_args+=("dataset.train.merge_text_p=${finetune_merge_text_p}")
+fi
+if [[ -n "$finetune_drop_desc_p" ]]; then
+    dora_args+=("dataset.train.drop_desc_p=${finetune_drop_desc_p}")
+fi
+if [[ -n "$finetune_drop_other_p" ]]; then
+    dora_args+=("dataset.train.drop_other_p=${finetune_drop_other_p}")
+fi
 
 exec dora "${dora_args[@]}"

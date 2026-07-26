@@ -133,11 +133,36 @@ settings without editing the script:
 | `--valid-samples` | `128` |
 | `--evaluate-samples` | `128` |
 | `--generate-samples` | `4` |
+| `--generate-every` | `5` |
+| `--checkpoint-every` | `5` |
+| `--word-dropout` | AudioCraft configuration |
+| `--cfg-dropout` | AudioCraft configuration |
+| `--merge-text-p` | AudioCraft configuration |
+| `--drop-desc-p` | AudioCraft configuration |
+| `--drop-other-p` | AudioCraft configuration |
 
 Run `bash train.sh --help` for the complete command reference. Set
 `--batch-size 1` if training runs out of GPU memory. On distributed runs,
 explicitly set `--train-samples` to at least the batch size multiplied by
 updates per epoch and world size.
+
+For a gentler, text-focused fine-tune that preserves more of the pretrained
+model while saving every epoch:
+
+```bash
+bash train.sh \
+  --lr 2e-6 \
+  --epochs 3 \
+  --updates-per-epoch 500 \
+  --warmup-steps 100 \
+  --word-dropout 0.1 \
+  --cfg-dropout 0.1 \
+  --merge-text-p 0 \
+  --drop-desc-p 0 \
+  --drop-other-p 0 \
+  --generate-every 1 \
+  --checkpoint-every 1
+```
 
 Reference preparation downloads two 500-track corpora under
 `/workspace/references`. Put `--output-root` on attached persistent storage if
