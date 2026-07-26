@@ -322,6 +322,17 @@ For every external FAD corpus it records the corpus path, `reference_set`,
 config hash, manifest hash, attribution hash, combined audio fingerprint, and
 reference count.
 
+To collect aggregate results from a remote checkout while preserving the
+`runs/<run-name>/metrics.json` layout locally:
+
+```bash
+eval/pull_metrics.sh -p 2222 user@host /remote/path/to/infinifi-finetuning
+```
+
+The script uses `~/.ssh/pem/prime-intellect.pem` for authentication. The port
+is optional, and a final positional argument can select a local project
+directory instead of the current directory.
+
 Existing complete results are reused only when their locked configuration
 matches. Use `--overwrite` to deliberately recompute them.
 
