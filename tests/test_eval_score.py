@@ -156,6 +156,24 @@ class EvalScoreTest(unittest.TestCase):
         self.write_fad_manifest(corpus_dir, records)
         return corpus_dir, records
 
+    def make_paired_corpus(
+        self,
+        reference_set: str = "musicgen-large-v1",
+        *,
+        count: int = 1,
+    ) -> tuple[Path, list[dict[str, object]]]:
+        corpus_dir, records = self.make_fad_corpus(
+            reference_set,
+            count=count,
+        )
+        for index, record in enumerate(records):
+            record["source_id"] = "source-1" if index == 0 else f"extra-{index}"
+            record["prompt"] = (
+                "Quiet piano lo-fi" if index == 0 else f"Extra prompt {index}"
+            )
+        self.write_fad_manifest(corpus_dir, records)
+        return corpus_dir, records
+
     def test_loads_complete_generated_run(self) -> None:
         run_dir = self.make_run()
 
@@ -228,6 +246,68 @@ class EvalScoreTest(unittest.TestCase):
             references["source-1"]["sha256"],
             score.sha256_file(reference_dir / "track.mp3"),
         )
+
+    def test_resolves_paired_reference_from_prepared_corpus(self) -> None:
+        self.make_run()
+        _, _, run_records = score.load_run("test-run")
+        corpus_dir, corpus_records = self.make_paired_corpus()
+        corpus = score.validate_reference_corpus(corpus_dir)
+
+        references = score.load_references(corpus_dir, run_records, corpus)
+
+        self.assertEqual(set(references), {"source-1"})
+        self.assertEqual(
+            references["source-1"]["audio_path"],
+            corpus_dir.resolve() / corpus_records[0]["audio_path"],
+        )
+        self.assertEqual(
+            references["source-1"]["sha256"],
+            corpus_records[0]["audio_sha256"],
+        )
+        self.assertEqual(
+            references["source-1"]["format"],
+            "reference_corpus_manifest",
+        )
+
+    def test_paired_reference_corpus_requires_musicgen_large(self) -> None:
+        self.make_run()
+        _, _, run_records = score.load_run("test-run")
+        corpus_dir, _ = self.make_paired_corpus("human-fma-lofi-v1")
+        corpus = score.validate_reference_corpus(corpus_dir)
+
+        with self.assertRaisesRegex(RuntimeError, "require.*musicgen-large-v1"):
+            score.load_references(corpus_dir, run_records, corpus)
+
+    def test_rejects_missing_paired_corpus_source(self) -> None:
+        self.make_run()
+        _, _, run_records = score.load_run("test-run")
+        corpus_dir, corpus_records = self.make_paired_corpus()
+        corpus_records[0]["source_id"] = "other-source"
+        self.write_fad_manifest(corpus_dir, corpus_records)
+
+        with self.assertRaisesRegex(RuntimeError, "missing frozen paired references"):
+            score.load_references(corpus_dir, run_records)
+
+    def test_rejects_duplicate_paired_corpus_source(self) -> None:
+        self.make_run()
+        _, _, run_records = score.load_run("test-run")
+        corpus_dir, corpus_records = self.make_paired_corpus(count=2)
+        corpus_records[1]["source_id"] = "source-1"
+        corpus_records[1]["prompt"] = "Quiet piano lo-fi"
+        self.write_fad_manifest(corpus_dir, corpus_records)
+
+        with self.assertRaisesRegex(RuntimeError, "Duplicate paired reference"):
+            score.load_references(corpus_dir, run_records)
+
+    def test_rejects_paired_corpus_prompt_mismatch(self) -> None:
+        self.make_run()
+        _, _, run_records = score.load_run("test-run")
+        corpus_dir, corpus_records = self.make_paired_corpus()
+        corpus_records[0]["prompt"] = "Different prompt"
+        self.write_fad_manifest(corpus_dir, corpus_records)
+
+        with self.assertRaisesRegex(RuntimeError, "Reference prompt mismatch"):
+            score.load_references(corpus_dir, run_records)
 
     def test_weighted_summary_uses_segment_counts(self) -> None:
         result = score.summary([1.0, 4.0], [1, 3])
@@ -640,6 +720,42 @@ class EvalScoreTest(unittest.TestCase):
                 ("musicgen-large-v1", len(synthetic_records)),
             ],
         )
+
+    def test_dry_run_reuses_musicgen_corpus_for_kld_and_fad(self) -> None:
+        self.make_run()
+        human_dir, _ = self.make_fad_corpus("human-fma-lofi-v1")
+        synthetic_dir, _ = self.make_paired_corpus()
+        arguments = [
+            "score.py",
+            "--run-name",
+            "test-run",
+            "--metrics",
+            "kld",
+            "fad",
+            "--dry-run",
+        ]
+        output = io.StringIO()
+
+        with (
+            mock.patch.object(sys, "argv", arguments),
+            mock.patch.object(score, "DEFAULT_REFERENCE_DIR", synthetic_dir),
+            mock.patch.object(
+                score,
+                "DEFAULT_FAD_REFERENCE_CORPORA",
+                (human_dir, synthetic_dir),
+            ),
+            mock.patch.object(
+                score,
+                "validate_reference_corpus",
+                wraps=score.validate_reference_corpus,
+            ) as validate_corpus,
+            redirect_stdout(output),
+        ):
+            score.main()
+
+        dry_run = json.loads(output.getvalue())
+        self.assertEqual(dry_run["reference_count"], 1)
+        self.assertEqual(validate_corpus.call_count, 2)
 
     def test_score_config_records_fad_corpus_provenance(self) -> None:
         run_dir = self.make_run()
