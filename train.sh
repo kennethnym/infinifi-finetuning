@@ -15,10 +15,6 @@ Options:
   --num-workers N         Data-loader workers (default: 4)
   --lr RATE               AdamW learning rate (default: 1e-5)
   --warmup-steps N        Cosine warmup updates (default: 5% of all updates)
-  --train-samples N       Samples per epoch for random file sampling
-                           (default: batch size x updates)
-  --random-file-sampling  Sample files uniformly with replacement instead of
-                           using the default deterministic file permutation
   --valid-samples N       Validation samples per epoch (default: 128)
   --evaluate-samples N    Evaluation samples (default: 128)
   --generate-samples N    Generated monitoring samples (default: 4)
@@ -88,8 +84,6 @@ finetune_segment_duration=20
 finetune_num_workers=4
 finetune_lr=1e-5
 finetune_warmup_steps=
-finetune_train_samples=
-finetune_file_permutation=true
 finetune_valid_samples=128
 finetune_evaluate_samples=128
 finetune_generate_samples=4
@@ -137,15 +131,6 @@ while (( $# > 0 )); do
             require_option_value "$@"
             finetune_warmup_steps="$2"
             shift 2
-            ;;
-        --train-samples)
-            require_option_value "$@"
-            finetune_train_samples="$2"
-            shift 2
-            ;;
-        --random-file-sampling)
-            finetune_file_permutation=false
-            shift
             ;;
         --valid-samples)
             require_option_value "$@"
@@ -246,11 +231,6 @@ require_nonnegative_integer --warmup-steps "$finetune_warmup_steps"
 (( finetune_warmup_steps < finetune_total_updates )) ||
     fail "--warmup-steps must be lower than the total number of updates"
 
-if [[ -z "$finetune_train_samples" ]]; then
-    finetune_train_samples=$((finetune_batch_size * finetune_updates_per_epoch))
-fi
-require_positive_integer --train-samples "$finetune_train_samples"
-
 dora_args=(
     -P audiocraft
     run
@@ -262,10 +242,9 @@ dora_args=(
     "dataset.num_workers=${finetune_num_workers}"
     "dataset.batch_size=${finetune_batch_size}"
     "dataset.segment_duration=${finetune_segment_duration}"
-    "dataset.train.num_samples=${finetune_train_samples}"
     dataset.sample_on_weight=false
     dataset.sample_on_duration=false
-    "dataset.permutation_on_files=${finetune_file_permutation}"
+    dataset.permutation_on_files=true
     "dataset.valid.num_samples=${finetune_valid_samples}"
     "dataset.evaluate.num_samples=${finetune_evaluate_samples}"
     "dataset.generate.num_samples=${finetune_generate_samples}"

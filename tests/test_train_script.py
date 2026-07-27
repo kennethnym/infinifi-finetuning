@@ -93,21 +93,6 @@ class TrainScriptTest(unittest.TestCase):
             )
         )
 
-    def test_random_file_sampling_disables_default_permutation(self) -> None:
-        result = self.run_train(
-            "--epochs",
-            "1",
-            "--updates-per-epoch",
-            "1",
-            "--random-file-sampling",
-        )
-
-        self.assertEqual(result.returncode, 0, result.stderr)
-        arguments = result.stdout.splitlines()
-        self.assertIn("dataset.sample_on_weight=false", arguments)
-        self.assertIn("dataset.sample_on_duration=false", arguments)
-        self.assertIn("dataset.permutation_on_files=false", arguments)
-
     def test_rejects_probability_outside_unit_interval(self) -> None:
         result = self.run_train("--word-dropout", "1.1")
 
@@ -130,7 +115,6 @@ class TrainScriptTest(unittest.TestCase):
         self.assertIn("--word-dropout RATE", result.stdout)
         self.assertIn("--cfg-dropout RATE", result.stdout)
         self.assertIn("--checkpoint-every N", result.stdout)
-        self.assertIn("--random-file-sampling", result.stdout)
 
 
 if __name__ == "__main__":

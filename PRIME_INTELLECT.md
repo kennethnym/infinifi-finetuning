@@ -233,7 +233,6 @@ settings without editing the script:
 | `--num-workers` | `4` |
 | `--lr` | `1e-5` |
 | `--warmup-steps` | 5% of total updates (`250`) |
-| `--train-samples` | batch size × updates per epoch (`1000`) |
 | file sampling | deterministic permutation |
 | `--valid-samples` | `128` |
 | `--evaluate-samples` | `128` |
@@ -251,9 +250,7 @@ Run `bash train.sh --help` for the complete command reference. Set
 the default file permutation derives the number of training samples from the
 batch size multiplied by updates per epoch and world size. Set updates per
 epoch to the selected track count divided by that global batch size when one
-epoch should be one complete pass. Use `--random-file-sampling` to restore
-uniform sampling with replacement; `--train-samples` controls the loader
-length in that mode.
+epoch should be one complete pass.
 
 For a gentler, text-focused fine-tune that preserves more of the pretrained
 model while saving every epoch:
