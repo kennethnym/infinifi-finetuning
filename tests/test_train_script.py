@@ -82,7 +82,8 @@ class TrainScriptTest(unittest.TestCase):
         self.assertIn("checkpoint.save_every=5", arguments)
         self.assertIn("dataset.sample_on_weight=false", arguments)
         self.assertIn("dataset.sample_on_duration=false", arguments)
-        self.assertIn("+dataset.train.permutation_on_files=true", arguments)
+        self.assertIn("dataset.train.permutation_on_files=true", arguments)
+        self.assertNotIn("+dataset.train.permutation_on_files=true", arguments)
         self.assertNotIn("+dataset.permutation_on_files=true", arguments)
         self.assertFalse(
             any("word_dropout=" in argument for argument in arguments)
