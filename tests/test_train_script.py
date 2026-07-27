@@ -80,6 +80,9 @@ class TrainScriptTest(unittest.TestCase):
         arguments = result.stdout.splitlines()
         self.assertIn("generate.every=5", arguments)
         self.assertIn("checkpoint.save_every=5", arguments)
+        self.assertIn("dataset.sample_on_weight=false", arguments)
+        self.assertIn("dataset.sample_on_duration=false", arguments)
+        self.assertIn("dataset.permutation_on_files=true", arguments)
         self.assertFalse(
             any("word_dropout=" in argument for argument in arguments)
         )
