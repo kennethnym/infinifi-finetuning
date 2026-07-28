@@ -113,6 +113,106 @@ class EvalGenerateTest(unittest.TestCase):
         self.assertEqual(config["generation"]["cfg_coef"], 5.0)
         self.assertEqual(generate.DEFAULT_GENERATION_PARAMS["cfg_coef"], 3.0)
 
+    def test_resolves_adapter_package(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            adapter_dir = Path(temporary_directory)
+            weights_path = adapter_dir / generate.ADAPTER_WEIGHTS
+            weights_path.write_bytes(b"adapter weights")
+            metadata = {
+                "schema_version": 1,
+                "format": "infinifi_musicgen_lora",
+                "base_model": "facebook/musicgen-small",
+                "audiocraft_commit": generate.AUDIOCRAFT_COMMIT,
+                "audiocraft_patch_sha256": generate.sha256_file(
+                    generate.AUDIOCRAFT_PATCH
+                ),
+                "lora": {
+                    "enabled": True,
+                    "rank": 8,
+                    "alpha": 8,
+                    "dropout": 0.05,
+                    "targets": [
+                        "self_attention",
+                        "cross_attention",
+                        "feedforward",
+                    ],
+                },
+                "files": {
+                    generate.ADAPTER_WEIGHTS: {
+                        "sha256": generate.sha256_file(weights_path),
+                        "size_bytes": weights_path.stat().st_size,
+                    }
+                },
+            }
+            (adapter_dir / generate.ADAPTER_METADATA).write_text(
+                json.dumps(metadata),
+                encoding="utf-8",
+            )
+
+            source, record = generate.resolve_model_source(str(adapter_dir))
+
+        self.assertEqual(source, str(adapter_dir.resolve()))
+        self.assertEqual(record["type"], "lora_adapter")
+        self.assertEqual(record["base_model"], "facebook/musicgen-small")
+        self.assertEqual(record["lora"]["rank"], 8)
+
+    def test_loads_adapter_on_the_frozen_base_model(self) -> None:
+        calls = []
+
+        class FakeLM:
+            def eval(self) -> None:
+                calls.append("eval")
+
+        model = SimpleNamespace(lm=FakeLM())
+
+        class FakeMusicGen:
+            @staticmethod
+            def get_pretrained(source: str, *, device: str) -> object:
+                calls.append(("base", source, device))
+                return model
+
+        torch_module = SimpleNamespace(
+            load=lambda *_args, **_kwargs: {
+                "format": "infinifi_musicgen_lora",
+                "state_dict": {"layer.lora_a": "tensor"},
+            }
+        )
+        audiocraft_module = ModuleType("audiocraft")
+        modules_module = ModuleType("audiocraft.modules")
+        lora_module = ModuleType("audiocraft.modules.lora")
+        lora_module.inject_lora = (
+            lambda lm, config: calls.append(("inject", lm, config["rank"]))
+        )
+        lora_module.load_adapter_state_dict = (
+            lambda lm, state: calls.append(("load", lm, state))
+        )
+
+        with mock.patch.dict(
+            sys.modules,
+            {
+                "audiocraft": audiocraft_module,
+                "audiocraft.modules": modules_module,
+                "audiocraft.modules.lora": lora_module,
+            },
+        ):
+            loaded = generate.load_musicgen_model(
+                FakeMusicGen,
+                torch_module,
+                "/adapter",
+                {
+                    "type": "lora_adapter",
+                    "base_model": "facebook/musicgen-small",
+                    "lora": {"enabled": True, "rank": 8},
+                },
+                "cpu",
+            )
+
+        self.assertIs(loaded, model)
+        self.assertEqual(calls[0], ("base", "facebook/musicgen-small", "cpu"))
+        self.assertEqual(calls[1][0], "inject")
+        self.assertEqual(calls[2][0], "load")
+        self.assertEqual(calls[3], "eval")
+
     def test_generates_prompts_in_batches(self) -> None:
         prompts = [
             {"id": f"prompt-{index}", "cohort": "test", "prompt": f"Prompt {index}"}

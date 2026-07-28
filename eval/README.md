@@ -143,7 +143,31 @@ Generation defaults to one clip at a time. To use accelerator parallelism, add
 the batch size is locked in the run configuration, so use the same value for
 baseline and fine-tuned runs. Lower it if generation runs out of device memory.
 
-## Generate a fine-tuned checkpoint run
+## Generate a LoRA adapter run
+
+After `train_lora.sh` completes, export its best adapter state and pass the
+package to the same generator:
+
+```bash
+DORA_SIGNATURE=aec31258
+python export_adapter.py \
+  --signature "$DORA_SIGNATURE" \
+  --output-dir /checkpoints/infinifi-lora-r8
+python eval/generate.py \
+  --model /checkpoints/infinifi-lora-r8 \
+  --run-name lora_r8
+```
+
+An adapter package contains `adapter.json` and `adapter_state.bin`. The
+generator verifies both files and their digest, loads the recorded
+`facebook/musicgen-small` base, injects the rank/configuration recorded in the
+manifest, and loads only the adapter tensors. Null-conditioned CFG rows bypass
+the adapter.
+
+Use distinct run names for rank, epoch, and CFG comparisons, for example
+`lora_r8_epoch1_cfg3` and `lora_r16_epoch1_cfg4`.
+
+## Generate a full fine-tuned checkpoint run
 
 Keep Dora checkpoint export separate from audio generation. After training,
 set the signature printed by Dora, export the LM with the

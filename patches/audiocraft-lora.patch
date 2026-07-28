@@ -1,0 +1,704 @@
+diff --git a/audiocraft/models/lm.py b/audiocraft/models/lm.py
+index 3bd6810..6bf2997 100644
+--- a/audiocraft/models/lm.py
++++ b/audiocraft/models/lm.py
+@@ -16,6 +16,7 @@ from torch import nn
+ from ..utils import utils
+ from ..modules.streaming import StreamingModule, State
+ from ..modules.transformer import StreamingTransformer, create_norm_fn
++from ..modules.lora import LoRAConfig
+ from ..modules.conditioners import (
+     ConditionFuser,
+     ClassifierFreeGuidanceDropout,
+@@ -148,6 +149,7 @@ class LMModel(StreamingModule):
+                  weight_init: tp.Optional[str] = None, depthwise_init: tp.Optional[str] = None,
+                  zero_bias_init: bool = False, cfg_dropout: float = 0, cfg_coef: float = 1.0,
+                  attribute_dropout: tp.Dict[str, tp.Dict[str, float]] = {}, two_step_cfg: bool = False,
++                 lora: tp.Optional[tp.Mapping[str, tp.Any]] = None,
+                  **kwargs):
+         super().__init__()
+         self.cfg_coef = cfg_coef
+@@ -161,12 +163,14 @@ class LMModel(StreamingModule):
+         self.dim = dim
+         self.pattern_provider = pattern_provider
+         self.two_step_cfg = two_step_cfg
++        self.lora_config = LoRAConfig.from_dict(lora)
+         self.emb = nn.ModuleList([ScaledEmbedding(embed_dim, dim, lr=emb_lr) for _ in range(n_q)])
+         if 'activation' in kwargs:
+             kwargs['activation'] = get_activation_fn(kwargs['activation'])
+         self.transformer = StreamingTransformer(
+             d_model=dim, num_heads=num_heads, dim_feedforward=int(hidden_scale * dim),
+-            norm=norm, norm_first=norm_first, **kwargs)
++            norm=norm, norm_first=norm_first,
++            lora=self.lora_config.to_dict(), **kwargs)
+         self.out_norm: tp.Optional[nn.Module] = None
+         if norm_first:
+             self.out_norm = create_norm_fn(norm, dim)
+@@ -217,6 +221,23 @@ class LMModel(StreamingModule):
+     def num_codebooks(self) -> int:
+         return self.n_q
+ 
++    def _adapter_gate(
++        self,
++        condition_tensors: ConditionTensors,
++        batch_size: int,
++        device: torch.device,
++    ) -> tp.Optional[torch.Tensor]:
++        if not self.lora_config.enabled:
++            return None
++        gate = torch.zeros(batch_size, dtype=torch.bool, device=device)
++        for _, mask in condition_tensors.values():
++            if mask.shape[0] != batch_size:
++                raise ValueError(
++                    "Conditioning batch size does not match the MusicGen token batch."
++                )
++            gate |= mask.to(device=device).reshape(batch_size, -1).bool().any(dim=1)
++        return gate
++
+     def forward(self, sequence: torch.Tensor,
+                 conditions: tp.List[ConditioningAttributes],
+                 condition_tensors: tp.Optional[ConditionTensors] = None,
+@@ -252,10 +273,12 @@ class LMModel(StreamingModule):
+         else:
+             assert not conditions, "Shouldn't pass both conditions and condition_tensors."
+ 
++        adapter_gate = self._adapter_gate(condition_tensors, B, input_.device)
+         input_, cross_attention_input = self.fuser(input_, condition_tensors)
+ 
+         out = self.transformer(input_, cross_attention_src=cross_attention_input,
+-                               src_mask=(self.attn_mask_per_stage[stage] if stage >= 0 else None))
++                               src_mask=(self.attn_mask_per_stage[stage] if stage >= 0 else None),
++                               adapter_gate=adapter_gate)
+         if self.out_norm:
+             out = self.out_norm(out)
+         logits = torch.stack([self.linears[k](out) for k in range(K)], dim=1)  # [B, K, S, card]
+diff --git a/audiocraft/modules/lora.py b/audiocraft/modules/lora.py
+new file mode 100644
+index 0000000..9d16540
+--- /dev/null
++++ b/audiocraft/modules/lora.py
+@@ -0,0 +1,192 @@
++# Copyright (c) Meta Platforms, Inc. and affiliates.
++# All rights reserved.
++#
++# This source code is licensed under the license found in the
++# LICENSE file in the root directory of this source tree.
++
++"""Low-rank adapters with per-sample conditioning gates."""
++
++from dataclasses import dataclass
++import math
++import typing as tp
++
++import torch
++from torch import nn
++from torch.nn import functional as F
++
++
++LORA_PARAMETER_MARKER = "lora_"
++SUPPORTED_TARGETS = frozenset({
++    "self_attention",
++    "cross_attention",
++    "feedforward",
++})
++
++
++@dataclass(frozen=True)
++class LoRAConfig:
++    enabled: bool = False
++    rank: int = 8
++    alpha: float = 8.0
++    dropout: float = 0.0
++    targets: tp.Tuple[str, ...] = tuple(sorted(SUPPORTED_TARGETS))
++
++    @classmethod
++    def from_dict(cls, config: tp.Optional[tp.Mapping[str, tp.Any]]) -> "LoRAConfig":
++        if config is None:
++            return cls()
++        targets = tuple(config.get("targets", sorted(SUPPORTED_TARGETS)))
++        value = cls(
++            enabled=bool(config.get("enabled", False)),
++            rank=int(config.get("rank", 8)),
++            alpha=float(config.get("alpha", config.get("rank", 8))),
++            dropout=float(config.get("dropout", 0.0)),
++            targets=targets,
++        )
++        value.validate()
++        return value
++
++    def validate(self) -> None:
++        if self.rank <= 0:
++            raise ValueError("LoRA rank must be a positive integer.")
++        if not math.isfinite(self.alpha) or self.alpha <= 0:
++            raise ValueError("LoRA alpha must be a finite positive number.")
++        if not math.isfinite(self.dropout) or not 0 <= self.dropout < 1:
++            raise ValueError("LoRA dropout must be in [0, 1).")
++        unknown_targets = set(self.targets) - SUPPORTED_TARGETS
++        if unknown_targets:
++            raise ValueError(f"Unsupported LoRA targets: {sorted(unknown_targets)}")
++        if self.enabled and not self.targets:
++            raise ValueError("At least one LoRA target is required when LoRA is enabled.")
++
++    def targets_module(self, target: str) -> bool:
++        return self.enabled and target in self.targets
++
++    def to_dict(self) -> tp.Dict[str, tp.Any]:
++        return {
++            "enabled": self.enabled,
++            "rank": self.rank,
++            "alpha": self.alpha,
++            "dropout": self.dropout,
++            "targets": list(self.targets),
++        }
++
++
++class GatedLoRAProjection(nn.Module):
++    """A bias-free LoRA projection whose delta can be gated per batch row."""
++
++    def __init__(
++        self,
++        in_features: int,
++        out_features: int,
++        config: LoRAConfig,
++        device=None,
++        dtype=None,
++    ):
++        super().__init__()
++        if not config.enabled:
++            raise ValueError("Cannot construct a LoRA projection from a disabled config.")
++        self.in_features = in_features
++        self.out_features = out_features
++        self.rank = config.rank
++        self.alpha = config.alpha
++        self.scaling = config.alpha / config.rank
++        self.dropout = config.dropout
++        factory_kwargs = {"device": device, "dtype": dtype}
++        self.lora_a = nn.Parameter(torch.empty(config.rank, in_features, **factory_kwargs))
++        self.lora_b = nn.Parameter(torch.zeros(out_features, config.rank, **factory_kwargs))
++        nn.init.kaiming_uniform_(self.lora_a, a=math.sqrt(5))
++
++    def forward(
++        self,
++        inputs: torch.Tensor,
++        gate: tp.Optional[torch.Tensor] = None,
++    ) -> torch.Tensor:
++        if inputs.shape[-1] != self.in_features:
++            raise ValueError(
++                f"LoRA input dimension mismatch: expected {self.in_features}, "
++                f"got {inputs.shape[-1]}"
++            )
++        adapter_inputs = F.dropout(inputs, self.dropout, self.training)
++        delta = F.linear(F.linear(adapter_inputs, self.lora_a), self.lora_b)
++        delta = delta * self.scaling
++        if gate is not None:
++            if gate.ndim != 1 or gate.shape[0] != inputs.shape[0]:
++                raise ValueError(
++                    "LoRA gate must have shape [batch], matching the projection input."
++                )
++            gate_shape = [gate.shape[0]] + [1] * (delta.ndim - 1)
++            delta = delta * gate.to(device=delta.device, dtype=delta.dtype).view(gate_shape)
++        return delta
++
++
++def is_lora_parameter_name(name: str) -> bool:
++    return any(part.startswith(LORA_PARAMETER_MARKER) for part in name.split("."))
++
++
++def iter_lora_parameters(module: nn.Module) -> tp.Iterator[nn.Parameter]:
++    for name, parameter in module.named_parameters():
++        if is_lora_parameter_name(name):
++            yield parameter
++
++
++def mark_only_lora_as_trainable(module: nn.Module) -> tp.List[nn.Parameter]:
++    parameters = []
++    for name, parameter in module.named_parameters():
++        parameter.requires_grad_(is_lora_parameter_name(name))
++        if parameter.requires_grad:
++            parameters.append(parameter)
++    if not parameters:
++        raise RuntimeError("LoRA is enabled but the model contains no LoRA parameters.")
++    return parameters
++
++
++def adapter_state_dict(module: nn.Module) -> tp.Dict[str, torch.Tensor]:
++    return {
++        name: tensor
++        for name, tensor in module.state_dict().items()
++        if is_lora_parameter_name(name)
++    }
++
++
++def load_adapter_state_dict(
++    module: nn.Module,
++    state_dict: tp.Mapping[str, torch.Tensor],
++) -> None:
++    expected = adapter_state_dict(module)
++    missing = set(expected) - set(state_dict)
++    unexpected = set(state_dict) - set(expected)
++    if missing or unexpected:
++        raise RuntimeError(
++            "LoRA state keys do not match the model: "
++            f"missing={sorted(missing)}, unexpected={sorted(unexpected)}"
++        )
++    parameters = dict(module.named_parameters())
++    with torch.no_grad():
++        for name, source in state_dict.items():
++            destination = parameters[name]
++            if destination.shape != source.shape:
++                raise RuntimeError(
++                    f"LoRA tensor shape mismatch for {name}: "
++                    f"expected {tuple(destination.shape)}, got {tuple(source.shape)}"
++                )
++            destination.copy_(source.to(device=destination.device, dtype=destination.dtype))
++
++
++def inject_lora(module: nn.Module, config: tp.Mapping[str, tp.Any]) -> LoRAConfig:
++    resolved = LoRAConfig.from_dict(config)
++    if not resolved.enabled:
++        raise ValueError("Cannot inject a disabled LoRA configuration.")
++    injected = 0
++    compatible_modules = [
++        child for child in module.modules()
++        if getattr(child, "enable_lora", None) is not None
++    ]
++    for child in compatible_modules:
++        enable_lora = getattr(child, "enable_lora", None)
++        injected += int(enable_lora(resolved))
++    if injected == 0:
++        raise RuntimeError("No compatible transformer layers accepted the LoRA adapter.")
++    if hasattr(module, "lora_config"):
++        module.lora_config = resolved
++    return resolved
+diff --git a/audiocraft/modules/transformer.py b/audiocraft/modules/transformer.py
+index 4d44b39..6d09770 100644
+--- a/audiocraft/modules/transformer.py
++++ b/audiocraft/modules/transformer.py
+@@ -22,6 +22,7 @@ from torch.nn import functional as F
+ from torch.utils.checkpoint import checkpoint as torch_checkpoint
+ from xformers import ops
+ 
++from .lora import GatedLoRAProjection, LoRAConfig
+ from .rope import RotaryEmbedding
+ from .streaming import StreamingModule
+ 
+@@ -183,6 +184,11 @@ class StreamingMultiheadAttention(StreamingModule):
+         self.num_heads = num_heads
+         self.dropout = dropout
+         self.kv_repeat = kv_repeat
++        self.kv_dim = (embed_dim // num_heads) * (num_heads // kv_repeat)
++        self.lora_q: tp.Optional[GatedLoRAProjection] = None
++        self.lora_k: tp.Optional[GatedLoRAProjection] = None
++        self.lora_v: tp.Optional[GatedLoRAProjection] = None
++        self.lora_out: tp.Optional[GatedLoRAProjection] = None
+         if cross_attention:
+             assert not causal, "Causal cannot work with cross attention."
+             assert rope is None, "Rope cannot work with cross attention."
+@@ -221,6 +227,27 @@ class StreamingMultiheadAttention(StreamingModule):
+             self.q_layer_norm = nn.LayerNorm(ln_dim)
+             self.k_layer_norm = nn.LayerNorm(ln_dim)
+ 
++    def _enable_lora(self, config: LoRAConfig) -> None:
++        if self.lora_q is not None:
++            return
++        if not self.custom:
++            raise ValueError(
++                "MusicGen LoRA requires custom or memory-efficient attention "
++                "because the standard attention path owns fused projections."
++            )
++        factory_kwargs = {
++            'device': self.in_proj_weight.device,
++            'dtype': self.in_proj_weight.dtype,
++        }
++        self.lora_q = GatedLoRAProjection(
++            self.embed_dim, self.embed_dim, config, **factory_kwargs)
++        self.lora_k = GatedLoRAProjection(
++            self.embed_dim, self.kv_dim, config, **factory_kwargs)
++        self.lora_v = GatedLoRAProjection(
++            self.embed_dim, self.kv_dim, config, **factory_kwargs)
++        self.lora_out = GatedLoRAProjection(
++            self.embed_dim, self.embed_dim, config, **factory_kwargs)
++
+     def _load_from_state_dict(self, state_dict, prefix, *args, **kwargs):
+         if not self.custom:
+             # Support compat with regular MHA
+@@ -314,7 +341,8 @@ class StreamingMultiheadAttention(StreamingModule):
+ 
+     def forward(self, query: torch.Tensor, key: torch.Tensor, value: torch.Tensor,
+                 key_padding_mask=None, need_weights=False, attn_mask=None,
+-                average_attn_weights=True, is_causal=False):
++                average_attn_weights=True, is_causal=False,
++                adapter_gate: tp.Optional[torch.Tensor] = None):
+         assert not is_causal, ("New param added in torch 2.0.1 not supported, "
+                                "use the causal args in the constructor.")
+ 
+@@ -355,6 +383,11 @@ class StreamingMultiheadAttention(StreamingModule):
+                 # todo: when streaming, we could actually save k, v and check the shape actually match.
+                 k = nn.functional.linear(key, self.in_proj_weight[dim: 2 * dim], bias_k)
+                 v = nn.functional.linear(value, self.in_proj_weight[2 * dim:], bias_v)
++                if self.lora_q is not None:
++                    assert self.lora_k is not None and self.lora_v is not None
++                    q = q + self.lora_q(query, adapter_gate)
++                    k = k + self.lora_k(key, adapter_gate)
++                    v = v + self.lora_v(value, adapter_gate)
+                 if self.qk_layer_norm is True:
+                     q = self.q_layer_norm(q)
+                     k = self.k_layer_norm(k)
+@@ -365,6 +398,13 @@ class StreamingMultiheadAttention(StreamingModule):
+                     assert query is key, "specialized implementation"
+                     assert value is key, "specialized implementation"
+                 projected = nn.functional.linear(query, self.in_proj_weight, self.in_proj_bias)
++                if self.lora_q is not None:
++                    assert self.lora_k is not None and self.lora_v is not None
++                    projected = projected + torch.cat([
++                        self.lora_q(query, adapter_gate),
++                        self.lora_k(query, adapter_gate),
++                        self.lora_v(query, adapter_gate),
++                    ], dim=-1)
+                 if self.kv_repeat == 1:
+                     if time_dim == 2:
+                         bound_layout = "b h p t d"
+@@ -438,7 +478,10 @@ class StreamingMultiheadAttention(StreamingModule):
+                 x = torch.einsum(f"b h t k, {key_layout} -> {layout}", w, v)
+             x = x.to(dtype)
+             x = rearrange(x, f"{layout} -> b t (h d)", h=self.num_heads)
+-            x = self.out_proj(x)
++            out_input = x
++            x = self.out_proj(out_input)
++            if self.lora_out is not None:
++                x = x + self.lora_out(out_input, adapter_gate)
+         else:
+             key, value = self._complete_kv(key, value)
+             if self.attention_as_float32:
+@@ -492,7 +535,9 @@ class StreamingTransformerLayer(nn.TransformerEncoderLayer):
+                  qk_layer_norm: bool = False, qk_layer_norm_cross: bool = False,
+                  cross_attention: bool = False, layer_scale: tp.Optional[float] = None,
+                  rope: tp.Optional[RotaryEmbedding] = None, attention_dropout: tp.Optional[float] = None,
+-                 kv_repeat: int = 1, norm: str = 'layer_norm', device=None, dtype=None, **kwargs):
++                 kv_repeat: int = 1, norm: str = 'layer_norm',
++                 lora: tp.Optional[tp.Mapping[str, tp.Any]] = None,
++                 device=None, dtype=None, **kwargs):
+         super().__init__(d_model, num_heads, dim_feedforward, dropout,
+                          device=device, dtype=dtype, batch_first=True, **kwargs)
+         factory_kwargs = {'device': device, 'dtype': dtype}
+@@ -512,6 +557,9 @@ class StreamingTransformerLayer(nn.TransformerEncoderLayer):
+         # Redefine feedforward layers to expose bias parameter
+         self.linear1 = nn.Linear(d_model, dim_feedforward, bias=bias_ff, **factory_kwargs)
+         self.linear2 = nn.Linear(dim_feedforward, d_model, bias=bias_ff, **factory_kwargs)
++        self.lora_linear1: tp.Optional[GatedLoRAProjection] = None
++        self.lora_linear2: tp.Optional[GatedLoRAProjection] = None
++        self._lora_config = LoRAConfig()
+ 
+         self.layer_scale_1: nn.Module
+         self.layer_scale_2: nn.Module
+@@ -538,18 +586,84 @@ class StreamingTransformerLayer(nn.TransformerEncoderLayer):
+                 self.layer_scale_cross = LayerScale(d_model, layer_scale, **factory_kwargs)
+         self.norm1 = create_norm_fn(norm, d_model, **factory_kwargs)  # type: ignore
+         self.norm2 = create_norm_fn(norm, d_model, **factory_kwargs)  # type: ignore
++        resolved_lora = LoRAConfig.from_dict(lora)
++        if resolved_lora.enabled:
++            self.enable_lora(resolved_lora)
++
++    def enable_lora(self, config: LoRAConfig) -> bool:
++        """Inject LoRA branches without replacing the frozen base projections."""
++        if self._lora_config.enabled:
++            if self._lora_config != config:
++                raise ValueError(
++                    "Cannot replace an existing LoRA adapter with a different configuration."
++                )
++            return False
++        if config.targets_module("self_attention"):
++            self.self_attn._enable_lora(config)
++        if config.targets_module("cross_attention") and self.cross_attention is not None:
++            self.cross_attention._enable_lora(config)
++        if config.targets_module("feedforward"):
++            self.lora_linear1 = GatedLoRAProjection(
++                self.linear1.in_features,
++                self.linear1.out_features,
++                config,
++                device=self.linear1.weight.device,
++                dtype=self.linear1.weight.dtype,
++            )
++            self.lora_linear2 = GatedLoRAProjection(
++                self.linear2.in_features,
++                self.linear2.out_features,
++                config,
++                device=self.linear2.weight.device,
++                dtype=self.linear2.weight.dtype,
++            )
++        self._lora_config = config
++        return True
++
++    def _self_attention_block(
++        self,
++        src: torch.Tensor,
++        src_mask: tp.Optional[torch.Tensor],
++        src_key_padding_mask: tp.Optional[torch.Tensor],
++        adapter_gate: tp.Optional[torch.Tensor],
++    ) -> torch.Tensor:
++        x = self.self_attn(
++            src, src, src,
++            attn_mask=src_mask,
++            key_padding_mask=src_key_padding_mask,
++            need_weights=False,
++            adapter_gate=adapter_gate,
++        )[0]
++        return self.dropout1(x)
++
++    def _feedforward_block(
++        self,
++        src: torch.Tensor,
++        adapter_gate: tp.Optional[torch.Tensor],
++    ) -> torch.Tensor:
++        hidden = self.linear1(src)
++        if self.lora_linear1 is not None:
++            hidden = hidden + self.lora_linear1(src, adapter_gate)
++        hidden = self.dropout(self.activation(hidden))
++        output = self.linear2(hidden)
++        if self.lora_linear2 is not None:
++            output = output + self.lora_linear2(hidden, adapter_gate)
++        return self.dropout2(output)
+ 
+     def _cross_attention_block(self, src: torch.Tensor,
+-                               cross_attention_src: torch.Tensor) -> torch.Tensor:
++                               cross_attention_src: torch.Tensor,
++                               adapter_gate: tp.Optional[torch.Tensor]) -> torch.Tensor:
+         assert self.cross_attention is not None
+         # queries are from src, keys and values from cross_attention_src.
+         x = self.cross_attention(
+-            src, cross_attention_src, cross_attention_src, need_weights=False)[0]
++            src, cross_attention_src, cross_attention_src, need_weights=False,
++            adapter_gate=adapter_gate)[0]
+         return self.dropout_cross(x)  # type: ignore
+ 
+     def forward(self, src: torch.Tensor, src_mask: tp.Optional[torch.Tensor] = None,  # type: ignore
+                 src_key_padding_mask: tp.Optional[torch.Tensor] = None,
+-                cross_attention_src: tp.Optional[torch.Tensor] = None):
++                cross_attention_src: tp.Optional[torch.Tensor] = None,
++                adapter_gate: tp.Optional[torch.Tensor] = None):
+         if self.cross_attention is None:
+             assert cross_attention_src is None
+         else:
+@@ -557,20 +671,26 @@ class StreamingTransformerLayer(nn.TransformerEncoderLayer):
+         x = src
+         if self.norm_first:
+             x = x + self.layer_scale_1(
+-                self._sa_block(self.norm1(x), src_mask, src_key_padding_mask))
++                self._self_attention_block(
++                    self.norm1(x), src_mask, src_key_padding_mask, adapter_gate))
+             if cross_attention_src is not None:
+                 x = x + self.layer_scale_cross(
+                     self._cross_attention_block(
+-                        self.norm_cross(x), cross_attention_src))
+-            x = x + self.layer_scale_2(self._ff_block(self.norm2(x)))
++                        self.norm_cross(x), cross_attention_src, adapter_gate))
++            x = x + self.layer_scale_2(
++                self._feedforward_block(self.norm2(x), adapter_gate))
+         else:
+             x = self.norm1(x + self.layer_scale_1(
+-                self._sa_block(x, src_mask, src_key_padding_mask)))
++                self._self_attention_block(
++                    x, src_mask, src_key_padding_mask, adapter_gate)))
+             if cross_attention_src is not None:
+                 x = self.norm_cross(
+                     x + self.layer_scale_cross(
+-                        self._cross_attention_block(src, cross_attention_src)))
+-            x = self.norm2(x + self.layer_scale_2(self._ff_block(x)))
++                        self._cross_attention_block(
++                            src, cross_attention_src, adapter_gate)))
++            x = self.norm2(
++                x + self.layer_scale_2(
++                    self._feedforward_block(x, adapter_gate)))
+         return x
+ 
+ 
+diff --git a/audiocraft/solvers/musicgen.py b/audiocraft/solvers/musicgen.py
+index 72b6533..a2dd759 100644
+--- a/audiocraft/solvers/musicgen.py
++++ b/audiocraft/solvers/musicgen.py
+@@ -23,6 +23,7 @@ from ..data.audio_dataset import AudioDataset
+ from ..data.music_dataset import MusicDataset, MusicInfo, AudioInfo
+ from ..data.audio_utils import normalize_audio
+ from ..modules.conditioners import JointEmbedCondition, SegmentWithAttributes, WavCondition
++from ..modules.lora import mark_only_lora_as_trainable
+ from ..utils.cache import CachedBatchWriter, CachedBatchLoader
+ from ..utils.samples.manager import SampleManager
+ from ..utils.utils import get_dataset_from_loader, is_jsonable, warn_once, model_hash
+@@ -136,12 +137,26 @@ class MusicGenSolver(base.StandardSolver):
+                          self.compression_model.frame_rate)
+         # instantiate LM model
+         self.model: models.LMModel = models.builders.get_lm_model(self.cfg).to(self.device)
++        optimizer_parameters = None
++        if self.model.lora_config.enabled:
++            if self.cfg.fsdp.use:
++                raise ValueError("MusicGen LoRA does not support FSDP.")
++            if self.cfg.optim.ema.use:
++                raise ValueError(
++                    "Full-model EMA must be disabled for LoRA training. "
++                    "Export the best validation adapter checkpoint instead."
++                )
++            optimizer_parameters = mark_only_lora_as_trainable(self.model)
++            trainable = sum(parameter.numel() for parameter in optimizer_parameters)
++            self.logger.info("Training MusicGen with %.2f M LoRA parameters.", trainable / 1e6)
+         if self.cfg.fsdp.use:
+             assert not self.cfg.autocast, "Cannot use autocast with fsdp"
+             self.model = self.wrap_with_fsdp(self.model)
+         self.register_ema('model')
+         # initialize optimization
+-        self.optimizer = builders.get_optimizer(builders.get_optim_parameter_groups(self.model), self.cfg.optim)
++        if optimizer_parameters is None:
++            optimizer_parameters = builders.get_optim_parameter_groups(self.model)
++        self.optimizer = builders.get_optimizer(optimizer_parameters, self.cfg.optim)
+         self.lr_scheduler = builders.get_lr_scheduler(self.optimizer, self.cfg.schedule, self.total_updates)
+         self.register_stateful('model', 'optimizer', 'lr_scheduler')
+         self.register_best_state('model')
+diff --git a/config/model/lm/default.yaml b/config/model/lm/default.yaml
+index 2d256ad..288e985 100644
+--- a/config/model/lm/default.yaml
++++ b/config/model/lm/default.yaml
+@@ -45,3 +45,9 @@ transformer_lm:
+   attention_dropout: null
+   kv_repeat: 1
+   two_step_cfg: false          # whether to do true 2 steps CFG, potentially resolving some padding issues or not...
++  lora:
++    enabled: false
++    rank: 8
++    alpha: 8
++    dropout: 0.0
++    targets: [self_attention, cross_attention, feedforward]
+diff --git a/tests/models/test_lm_lora.py b/tests/models/test_lm_lora.py
+new file mode 100644
+index 0000000..de23379
+--- /dev/null
++++ b/tests/models/test_lm_lora.py
+@@ -0,0 +1,27 @@
++from types import SimpleNamespace
++
++import torch
++
++from audiocraft.models.lm import LMModel
++from audiocraft.modules.lora import LoRAConfig
++
++
++def test_adapter_gate_is_derived_from_all_condition_masks():
++    model = SimpleNamespace(
++        lora_config=LoRAConfig.from_dict({"enabled": True, "rank": 2})
++    )
++    condition_tensors = {
++        "description": (
++            torch.zeros(3, 2, 4),
++            torch.tensor([[1, 1], [0, 0], [0, 0]]),
++        ),
++        "melody": (
++            torch.zeros(3, 1, 4),
++            torch.tensor([[0], [1], [0]]),
++        ),
++    }
++
++    gate = LMModel._adapter_gate(
++        model, condition_tensors, batch_size=3, device=torch.device("cpu"))
++
++    assert torch.equal(gate, torch.tensor([True, True, False]))
+diff --git a/tests/modules/test_lora.py b/tests/modules/test_lora.py
+new file mode 100644
+index 0000000..fc776cb
+--- /dev/null
++++ b/tests/modules/test_lora.py
+@@ -0,0 +1,97 @@
++import pytest
++import torch
++
++from audiocraft.modules.lora import (
++    LoRAConfig,
++    adapter_state_dict,
++    inject_lora,
++    iter_lora_parameters,
++    load_adapter_state_dict,
++    mark_only_lora_as_trainable,
++)
++from audiocraft.modules.transformer import StreamingTransformer
++
++
++def lora_config(rank=2):
++    return {
++        "enabled": True,
++        "rank": rank,
++        "alpha": rank,
++        "dropout": 0.0,
++        "targets": ["self_attention", "cross_attention", "feedforward"],
++    }
++
++
++def test_lora_config_validation():
++    with pytest.raises(ValueError, match="rank"):
++        LoRAConfig.from_dict({"enabled": True, "rank": 0})
++    with pytest.raises(ValueError, match="targets"):
++        LoRAConfig.from_dict({"enabled": True, "targets": ["unknown"]})
++
++
++def test_zero_initialization_and_per_sample_null_gate():
++    torch.manual_seed(1234)
++    base = StreamingTransformer(
++        16, 4, 2, custom=True, cross_attention=True,
++        dim_feedforward=64, dropout=0.0, positional_scale=0.0)
++    adapted = StreamingTransformer(
++        16, 4, 2, custom=True, cross_attention=True,
++        dim_feedforward=64, dropout=0.0, positional_scale=0.0,
++        lora=lora_config())
++    adapted.load_state_dict(base.state_dict(), strict=False)
++    inputs = torch.randn(2, 5, 16)
++    condition = torch.randn(2, 3, 16)
++    gate = torch.tensor([True, False])
++
++    reference = base(inputs, cross_attention_src=condition)
++    initial = adapted(
++        inputs, cross_attention_src=condition, adapter_gate=gate)
++    assert torch.equal(reference, initial)
++
++    with torch.no_grad():
++        for name, parameter in adapted.named_parameters():
++            if name.endswith("lora_b"):
++                parameter.fill_(0.01)
++    output = adapted(
++        inputs, cross_attention_src=condition, adapter_gate=gate)
++    assert not torch.equal(reference[0], output[0])
++    assert torch.equal(reference[1], output[1])
++
++
++def test_rank_parameter_count_freezing_and_state_round_trip():
++    rank = 2
++    dimension = 16
++    layers = 2
++    model = StreamingTransformer(
++        dimension, 4, layers, custom=True, cross_attention=True,
++        dim_feedforward=4 * dimension, dropout=0.0, lora=lora_config(rank))
++    expected = layers * 26 * dimension * rank
++    assert sum(parameter.numel() for parameter in iter_lora_parameters(model)) == expected
++
++    trainable = mark_only_lora_as_trainable(model)
++    assert sum(parameter.numel() for parameter in trainable) == expected
++    assert all(
++        parameter.requires_grad == ("lora_" in name)
++        for name, parameter in model.named_parameters()
++    )
++
++    saved = {
++        name: value.detach().clone()
++        for name, value in adapter_state_dict(model).items()
++    }
++    clone = StreamingTransformer(
++        dimension, 4, layers, custom=True, cross_attention=True,
++        dim_feedforward=4 * dimension, dropout=0.0, lora=lora_config(rank))
++    load_adapter_state_dict(clone, saved)
++    assert all(
++        torch.equal(saved[name], value)
++        for name, value in adapter_state_dict(clone).items()
++    )
++
++
++def test_dynamic_injection():
++    model = StreamingTransformer(
++        16, 4, 1, custom=True, cross_attention=True,
++        dim_feedforward=64, dropout=0.0)
++    inject_lora(model, lora_config())
++    assert adapter_state_dict(model)

@@ -45,6 +45,7 @@ RUN curl -Ls https://micro.mamba.pm/api/micromamba/linux-64/latest \
 WORKDIR /workspace
 
 COPY audiocraft-requirements.txt pipeline-requirements.txt ./
+COPY patches/audiocraft-lora.patch /workspace/patches/audiocraft-lora.patch
 
 RUN sed '/^nvidia-/d; /^pip==/d; /^setuptools==/d' \
         audiocraft-requirements.txt > /tmp/audiocraft-requirements.txt \
@@ -53,13 +54,15 @@ RUN sed '/^nvidia-/d; /^pip==/d; /^setuptools==/d' \
 
 RUN git clone https://github.com/facebookresearch/audiocraft.git /workspace/audiocraft \
     && git -C /workspace/audiocraft checkout --detach "${AUDIOCRAFT_COMMIT}" \
+    && git -C /workspace/audiocraft apply --check /workspace/patches/audiocraft-lora.patch \
+    && git -C /workspace/audiocraft apply /workspace/patches/audiocraft-lora.patch \
     && python -m pip install --no-cache-dir --no-deps -e /workspace/audiocraft \
     && rm -rf /workspace/audiocraft/.git
 
-COPY prepare.py export_checkpoint.py train.sh ./
+COPY prepare.py export_checkpoint.py export_adapter.py train.sh train_lora.sh ./
 COPY eval ./eval
 
-RUN chmod +x /workspace/train.sh \
+RUN chmod +x /workspace/train.sh /workspace/train_lora.sh \
     && python -c "import audiocraft, datasets, keybert, torch; print(f'torch={torch.__version__}, cuda={torch.version.cuda}')"
 
 EXPOSE 22

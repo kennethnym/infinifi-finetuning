@@ -19,6 +19,7 @@ CHECKSUM_PATH = EVAL_DIR / "prompts.sha256"
 RUNS_ROOT = PROJECT_ROOT / "runs"
 
 AUDIOCRAFT_COMMIT = "adf0b04a4452f171970028fcf80f101dd5e26e19"
+AUDIOCRAFT_PATCH = PROJECT_ROOT / "patches" / "audiocraft-lora.patch"
 DEFAULT_GENERATION_PARAMS = {
     "duration": 30,
     "use_sampling": True,
@@ -35,6 +36,9 @@ AUDIO_WRITE_PARAMS = {
 SAFE_ID = re.compile(r"^[A-Za-z0-9._-]+$")
 SAFE_RUN_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 LOCAL_MODEL_FILES = ("state_dict.bin", "compression_state_dict.bin")
+ADAPTER_METADATA = "adapter.json"
+ADAPTER_WEIGHTS = "adapter_state.bin"
+ADAPTER_FILES = (ADAPTER_METADATA, ADAPTER_WEIGHTS)
 
 
 def parse_args() -> argparse.Namespace:
@@ -231,6 +235,82 @@ def model_package_digest(directory: Path) -> tuple[str, int]:
     return digest.hexdigest(), len(files)
 
 
+def load_adapter_metadata(directory: Path) -> dict[str, Any]:
+    missing = [
+        filename
+        for filename in ADAPTER_FILES
+        if not (directory / filename).is_file()
+        or (directory / filename).is_symlink()
+    ]
+    if missing:
+        raise RuntimeError(
+            f"Local adapter package is incomplete; missing regular files: {missing}"
+        )
+    metadata_path = directory / ADAPTER_METADATA
+    try:
+        adapter = json.loads(metadata_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as error:
+        raise RuntimeError(f"Invalid adapter metadata: {metadata_path}") from error
+    fixed = {
+        "schema_version": 1,
+        "format": "infinifi_musicgen_lora",
+        "audiocraft_commit": AUDIOCRAFT_COMMIT,
+        "audiocraft_patch_sha256": sha256_file(AUDIOCRAFT_PATCH),
+    }
+    for key, expected in fixed.items():
+        if adapter.get(key) != expected:
+            raise RuntimeError(
+                f"Adapter metadata {key} does not match: "
+                f"expected {expected!r}, got {adapter.get(key)!r}"
+            )
+    base_model = adapter.get("base_model")
+    if not isinstance(base_model, str) or not base_model:
+        raise RuntimeError("Adapter metadata has no base model")
+    lora = adapter.get("lora")
+    if not isinstance(lora, dict) or not lora.get("enabled"):
+        raise RuntimeError("Adapter metadata has no enabled LoRA configuration")
+    rank = lora.get("rank")
+    alpha = lora.get("alpha")
+    dropout = lora.get("dropout")
+    targets = lora.get("targets")
+    supported_targets = {
+        "self_attention",
+        "cross_attention",
+        "feedforward",
+    }
+    if isinstance(rank, bool) or not isinstance(rank, int) or rank <= 0:
+        raise RuntimeError("Adapter metadata has an invalid LoRA rank")
+    if (
+        isinstance(alpha, bool)
+        or not isinstance(alpha, (int, float))
+        or not math.isfinite(alpha)
+        or alpha <= 0
+    ):
+        raise RuntimeError("Adapter metadata has an invalid LoRA alpha")
+    if (
+        isinstance(dropout, bool)
+        or not isinstance(dropout, (int, float))
+        or not math.isfinite(dropout)
+        or not 0 <= dropout < 1
+    ):
+        raise RuntimeError("Adapter metadata has an invalid LoRA dropout")
+    if (
+        not isinstance(targets, list)
+        or not targets
+        or any(not isinstance(target, str) for target in targets)
+        or set(targets) - supported_targets
+    ):
+        raise RuntimeError("Adapter metadata has invalid LoRA targets")
+    recorded_weights = adapter.get("files", {}).get(ADAPTER_WEIGHTS)
+    actual_weights = {
+        "sha256": sha256_file(directory / ADAPTER_WEIGHTS),
+        "size_bytes": (directory / ADAPTER_WEIGHTS).stat().st_size,
+    }
+    if recorded_weights != actual_weights:
+        raise RuntimeError("Adapter weight hash or size does not match adapter metadata")
+    return adapter
+
+
 def resolve_model_source(
     supplied_source: str,
 ) -> tuple[str, dict[str, Any]]:
@@ -239,6 +319,21 @@ def resolve_model_source(
         if not candidate.is_dir():
             raise RuntimeError(f"Local model source is not a directory: {candidate}")
         directory = candidate.resolve()
+        if (directory / ADAPTER_METADATA).exists() or (directory / ADAPTER_WEIGHTS).exists():
+            adapter = load_adapter_metadata(directory)
+            package_sha256, file_count = model_package_digest(directory)
+            return str(directory), {
+                "type": "lora_adapter",
+                "supplied": supplied_source,
+                "path": display_path(directory),
+                "package_sha256": package_sha256,
+                "file_count": file_count,
+                "base_model": adapter["base_model"],
+                "lora": adapter["lora"],
+                "adapter_weights_sha256": adapter["files"][ADAPTER_WEIGHTS]["sha256"],
+                "audiocraft_commit": AUDIOCRAFT_COMMIT,
+                "audiocraft_patch_sha256": adapter["audiocraft_patch_sha256"],
+            }
         missing = [
             filename
             for filename in LOCAL_MODEL_FILES
@@ -267,6 +362,46 @@ def resolve_model_source(
         "model_id": supplied_source,
         "audiocraft_commit": AUDIOCRAFT_COMMIT,
     }
+
+
+def load_musicgen_model(
+    MusicGen: Any,
+    torch: Any,
+    model_source: str,
+    model_source_record: dict[str, Any],
+    device: str,
+) -> Any:
+    if model_source_record["type"] != "lora_adapter":
+        return MusicGen.get_pretrained(model_source, device=device)
+
+    try:
+        from audiocraft.modules.lora import inject_lora, load_adapter_state_dict
+    except ImportError as error:
+        raise RuntimeError(
+            "LoRA adapter generation requires the patched AudioCraft build."
+        ) from error
+
+    adapter_directory = Path(model_source)
+    model = MusicGen.get_pretrained(
+        model_source_record["base_model"],
+        device=device,
+    )
+    inject_lora(model.lm, model_source_record["lora"])
+    package = torch.load(
+        adapter_directory / ADAPTER_WEIGHTS,
+        map_location="cpu",
+    )
+    if (
+        not isinstance(package, dict)
+        or package.get("format") != "infinifi_musicgen_lora"
+        or not isinstance(package.get("state_dict"), dict)
+    ):
+        raise RuntimeError(
+            f"Invalid LoRA adapter weights: {adapter_directory / ADAPTER_WEIGHTS}"
+        )
+    load_adapter_state_dict(model.lm, package["state_dict"])
+    model.lm.eval()
+    return model
 
 
 def build_locked_config(
@@ -472,7 +607,13 @@ def generate(
     ]
 
     print(f"loading {args.model} on {device}...")
-    model = MusicGen.get_pretrained(model_source, device=device)
+    model = load_musicgen_model(
+        MusicGen,
+        torch,
+        model_source,
+        locked_config["model_source"],
+        device,
+    )
     model.set_generation_params(**locked_config["generation"])
 
     runtime_path = output_dir / "runtime.json"

@@ -78,7 +78,8 @@ python prepare.py \
   --train-count 6000 \
   --valid-count 750 \
   --clap-batch-size 32
-bash train.sh \
+bash train_lora.sh \
+  --rank 8 \
   --epochs 1 \
   --updates-per-epoch 10 \
   --segment-duration 5 \
@@ -86,9 +87,9 @@ bash train.sh \
   --evaluate-samples 4 \
   --generate-samples 1
 DORA_SIGNATURE=aec31258  # Replace with the signature printed by Dora.
-python export_checkpoint.py --signature "$DORA_SIGNATURE" --output-dir /checkpoints/infinifi
-python eval/generate.py --model /checkpoints/infinifi --run-name finetuned_infinifi --dry-run
-python eval/generate.py --model /checkpoints/infinifi --run-name finetuned_infinifi
+python export_adapter.py --signature "$DORA_SIGNATURE" --output-dir /checkpoints/infinifi-lora-r8
+python eval/generate.py --model /checkpoints/infinifi-lora-r8 --run-name lora_r8 --dry-run
+python eval/generate.py --model /checkpoints/infinifi-lora-r8 --run-name lora_r8
 ```
 
 Run the baseline generator before fine-tuning. It writes the plain
@@ -98,12 +99,11 @@ Run the baseline generator before fine-tuning. It writes the plain
 `prepare.py` writes its selected dataset and manifests under
 `/workspace/audiocraft`.
 AudioCraft/Dora writes training runs according to its default grid and cache
-configuration. After training, pass the Dora signature to
-`export_checkpoint.py`. Exporting only packages the LM and pinned
-`facebook/encodec_32khz` compression model; `eval/generate.py` performs audio
-generation for both pretrained model IDs and exported package directories.
-The fine-tuned example writes to the distinct
-`/workspace/runs/finetuned_infinifi` run directory.
+configuration. After adapter training, pass the Dora signature to
+`export_adapter.py`. The adapter package records the pinned base model and
+contains only LoRA tensors; `eval/generate.py` loads the base model, injects
+the adapter, and applies it only to conditioned CFG rows. The example writes
+to the distinct `/workspace/runs/lora_r8` run directory.
 
 ### Dataset curation
 
@@ -205,7 +205,38 @@ python eval/generate.py \
   --cfg-coef 4
 ```
 
-### Fine-tuning
+### LoRA adapter tuning
+
+`train_lora.sh` freezes MusicGen, T5, and EnCodec and trains gated LoRA
+projections in every self-attention, cross-attention, and feed-forward block.
+The adapter is disabled per sample when every conditioning mask is empty, so
+the CFG null branch remains the exact pretrained model. The defaults run 1,500
+updates with rank 8, alpha 8, adapter dropout 0.05, and learning rate `1e-4`:
+
+```bash
+bash train_lora.sh --rank 8
+bash train_lora.sh --rank 16
+```
+
+Run the rank experiments with otherwise identical arguments. Alpha defaults
+to the selected rank, and both runs use seed 2036. Classifier-free, T5 word,
+and metadata dropout are disabled so rank is the controlled variable.
+Full-model EMA and FSDP are not supported by this adapter path.
+
+Export each rank or periodic epoch to its own immutable package:
+
+```bash
+python export_adapter.py \
+  --signature "$DORA_SIGNATURE" \
+  --checkpoint 1 \
+  --output-dir /checkpoints/infinifi-lora-r8-epoch1
+```
+
+The package contains `adapter.json` and `adapter_state.bin`. It deliberately
+cannot be merged into the base weights because merging would also alter null
+conditioning.
+
+### Full-model fine-tuning (legacy)
 
 `train.sh` fine-tunes the pretrained `facebook/musicgen-small` model on the
 prepared lo-fi dataset. It does not perform teacher-student distillation. Its
