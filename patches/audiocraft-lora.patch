@@ -518,7 +518,7 @@ index 4d44b39..6d09770 100644
 
 
 diff --git a/audiocraft/solvers/musicgen.py b/audiocraft/solvers/musicgen.py
-index 72b6533..0b5daf2 100644
+index 72b6533..93e4e8e 100644
 --- a/audiocraft/solvers/musicgen.py
 +++ b/audiocraft/solvers/musicgen.py
 @@ -22,7 +22,15 @@ from .. import models
@@ -656,7 +656,7 @@ index 72b6533..0b5daf2 100644
          self.lr_scheduler = builders.get_lr_scheduler(self.optimizer, self.cfg.schedule, self.total_updates)
          self.register_stateful('model', 'optimizer', 'lr_scheduler')
          self.register_best_state('model')
-@@ -243,6 +334,91 @@ class MusicGenSolver(base.StandardSolver):
+@@ -243,6 +334,128 @@ class MusicGenSolver(base.StandardSolver):
          ce = ce / K
          return ce, ce_per_codebook
 
@@ -708,13 +708,50 @@ index 72b6533..0b5daf2 100644
 +            raise ValueError(
 +                "Conditional and unconditional conditioner keys do not match."
 +            )
-+        return {
-+            key: (
-+                torch.cat([conditional[key][0], unconditional[key][0]], dim=0),
-+                torch.cat([conditional[key][1], unconditional[key][1]], dim=0),
++        combined: tp.Dict[str, ConditionType] = {}
++        for key in conditional:
++            conditional_values, conditional_mask = conditional[key]
++            unconditional_values, unconditional_mask = unconditional[key]
++            if (
++                conditional_values.ndim != unconditional_values.ndim
++                or conditional_values.shape[2:] != unconditional_values.shape[2:]
++            ):
++                raise ValueError(
++                    f"Conditional and unconditional '{key}' tensor shapes "
++                    "cannot be padded together."
++                )
++            for values, mask in (
++                (conditional_values, conditional_mask),
++                (unconditional_values, unconditional_mask),
++            ):
++                if values.ndim < 2 or mask.ndim != 2 or values.shape[:2] != mask.shape:
++                    raise ValueError(
++                        f"Conditioner '{key}' values and mask shapes do not match."
++                    )
++            sequence_length = max(
++                conditional_values.shape[1],
++                unconditional_values.shape[1],
 +            )
-+            for key in conditional
-+        }
++
++            def _pad(
++                values: torch.Tensor,
++                mask: torch.Tensor,
++            ) -> ConditionType:
++                padding = sequence_length - values.shape[1]
++                if padding == 0:
++                    return values, mask
++                value_padding = (0, 0) * (values.ndim - 2) + (0, padding)
++                return F.pad(values, value_padding), F.pad(mask, (0, padding))
++
++            conditional_values, conditional_mask = _pad(
++                conditional_values, conditional_mask)
++            unconditional_values, unconditional_mask = _pad(
++                unconditional_values, unconditional_mask)
++            combined[key] = (
++                torch.cat([conditional_values, unconditional_values], dim=0),
++                torch.cat([conditional_mask, unconditional_mask], dim=0),
++            )
++        return combined
 +
 +    def _distillation_attributes(
 +        self,
@@ -748,7 +785,7 @@ index 72b6533..0b5daf2 100644
      def _prepare_tokens_and_attributes(
          self, batch: tp.Tuple[torch.Tensor, tp.List[SegmentWithAttributes]],
          check_synchronization_points: bool = False
-@@ -361,12 +537,47 @@ class MusicGenSolver(base.StandardSolver):
+@@ -361,12 +574,47 @@ class MusicGenSolver(base.StandardSolver):
          if check_synchronization_points:
              torch.cuda.set_sync_debug_mode('warn')
 
@@ -797,7 +834,7 @@ index 72b6533..0b5daf2 100644
          self.deadlock_detect.update('loss')
 
          if check_synchronization_points:
-@@ -416,6 +627,11 @@ class MusicGenSolver(base.StandardSolver):
+@@ -416,6 +664,11 @@ class MusicGenSolver(base.StandardSolver):
 
          metrics['ce'] = ce
          metrics['ppl'] = torch.exp(ce)
@@ -1007,10 +1044,10 @@ index 0000000..90512a2
 +    assert adapter_state_dict(model)
 diff --git a/tests/solvers/test_musicgen_distillation.py b/tests/solvers/test_musicgen_distillation.py
 new file mode 100644
-index 0000000..efa88b8
+index 0000000..81b856d
 --- /dev/null
 +++ b/tests/solvers/test_musicgen_distillation.py
-@@ -0,0 +1,87 @@
+@@ -0,0 +1,92 @@
 +from types import SimpleNamespace
 +
 +import pytest
@@ -1078,16 +1115,20 @@ index 0000000..efa88b8
 +            solver(), student, teacher, mask)
 +
 +
-+def test_condition_tensors_are_concatenated_by_branch():
++def test_condition_tensors_are_padded_and_concatenated_by_branch():
 +    conditional = {
 +        "description": (
-+            torch.tensor([[[1.0]]]),
-+            torch.tensor([[1]]),
++            torch.tensor([[
++                [1.0, 2.0],
++                [3.0, 4.0],
++                [5.0, 6.0],
++            ]]),
++            torch.tensor([[1, 1, 1]]),
 +        ),
 +    }
 +    unconditional = {
 +        "description": (
-+            torch.tensor([[[0.0]]]),
++            torch.tensor([[[7.0, 8.0]]]),
 +            torch.tensor([[0]]),
 +        ),
 +    }
@@ -1096,5 +1137,6 @@ index 0000000..efa88b8
 +        conditional, unconditional)
 +
 +    values, mask = combined["description"]
-+    assert values[:, 0, 0].tolist() == [1.0, 0.0]
-+    assert mask[:, 0].tolist() == [1, 0]
++    assert values.shape == (2, 3, 2)
++    assert mask.tolist() == [[1, 1, 1], [0, 0, 0]]
++    assert values[1].tolist() == [[7.0, 8.0], [0.0, 0.0], [0.0, 0.0]]
