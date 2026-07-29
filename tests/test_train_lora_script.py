@@ -10,7 +10,11 @@ TRAIN_SCRIPT = PROJECT_ROOT / "train_lora.sh"
 
 
 class TrainLoRAScriptTest(unittest.TestCase):
-    def run_train(self, *arguments: str) -> subprocess.CompletedProcess[str]:
+    def run_train(
+        self,
+        *arguments: str,
+        python_exit_code: int = 0,
+    ) -> subprocess.CompletedProcess[str]:
         with tempfile.TemporaryDirectory() as directory:
             bin_dir = Path(directory)
             fake_dora = bin_dir / "dora"
@@ -19,6 +23,12 @@ class TrainLoRAScriptTest(unittest.TestCase):
                 encoding="utf-8",
             )
             fake_dora.chmod(0o755)
+            fake_python = bin_dir / "python"
+            fake_python.write_text(
+                f"#!/bin/sh\nexit {python_exit_code}\n",
+                encoding="utf-8",
+            )
+            fake_python.chmod(0o755)
             environment = os.environ.copy()
             environment["PATH"] = f"{bin_dir}:{environment['PATH']}"
             return subprocess.run(
@@ -49,8 +59,8 @@ class TrainLoRAScriptTest(unittest.TestCase):
             "transformer_lm.lora.rank=16",
             "transformer_lm.lora.alpha=16",
             "transformer_lm.lora.dropout=0.05",
-            "transformer_lm.lora.condition_gated=true",
-            "distillation.enabled=false",
+            "++transformer_lm.lora.condition_gated=true",
+            "++distillation.enabled=false",
             "optim.ema.use=false",
             "classifier_free_guidance.training_dropout=0",
             "conditioners.description.t5.word_dropout=0",
@@ -79,15 +89,15 @@ class TrainLoRAScriptTest(unittest.TestCase):
             "transformer_lm.lora.enabled=true",
             "transformer_lm.lora.rank=16",
             "transformer_lm.lora.alpha=16",
-            "transformer_lm.lora.condition_gated=false",
+            "++transformer_lm.lora.condition_gated=false",
             "dataset.batch_size=1",
             "optim.lr=3e-5",
-            "distillation.enabled=true",
-            "distillation.teacher_checkpoint=facebook/musicgen-large",
-            "distillation.temperature=2",
-            "distillation.kl_weight=0.75",
-            "distillation.ce_weight=0.25",
-            "distillation.cfg_branches=true",
+            "++distillation.enabled=true",
+            "++distillation.teacher_checkpoint=facebook/musicgen-large",
+            "++distillation.temperature=2",
+            "++distillation.kl_weight=0.75",
+            "++distillation.ce_weight=0.25",
+            "++distillation.cfg_branches=true",
         }
         self.assertTrue(expected.issubset(arguments), expected - arguments)
 
@@ -105,9 +115,15 @@ class TrainLoRAScriptTest(unittest.TestCase):
 
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn(
-            "distillation.cfg_branches=false",
+            "++distillation.cfg_branches=false",
             result.stdout.splitlines(),
         )
+
+    def test_rejects_an_install_without_distillation_support(self) -> None:
+        result = self.run_train("--distill", python_exit_code=1)
+
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("installed AudioCraft lacks the distillation patch", result.stderr)
 
     def test_rejects_zero_distillation_weight(self) -> None:
         result = self.run_train("--distill", "--kd-weight", "0")

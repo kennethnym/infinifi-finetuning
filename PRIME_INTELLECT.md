@@ -28,6 +28,12 @@ docker push <dockerhub-user>/infinifi-finetuning:latest
 The build downloads the pinned AudioCraft source. It does not include datasets,
 Hugging Face models, training outputs, or checkpoints.
 
+Rebuild the image after changing or pulling a new
+`patches/audiocraft-lora.patch`. Updating the repository inside an existing
+container does not update the editable AudioCraft installation baked into that
+image; `train_lora.sh --distill` detects this stale-install case before
+launching Dora.
+
 ## Create the Prime Intellect template
 
 1. Create a custom template using the pushed image name.

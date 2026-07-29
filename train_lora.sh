@@ -84,6 +84,19 @@ require_adapter_dropout() {
         fail "--adapter-dropout must be a number greater than or equal to 0 and lower than 1"
 }
 
+verify_distillation_support() {
+    python -c '
+from audiocraft.modules.lora import LoRAConfig
+from audiocraft.solvers.musicgen import MusicGenSolver
+
+if "condition_gated" not in LoRAConfig.__dataclass_fields__:
+    raise SystemExit(1)
+if not hasattr(MusicGenSolver, "_compute_distillation_kl"):
+    raise SystemExit(1)
+' >/dev/null 2>&1 || fail \
+        "installed AudioCraft lacks the distillation patch; rebuild the image or reinstall AudioCraft with patches/audiocraft-lora.patch"
+}
+
 lora_distill=false
 lora_teacher=facebook/musicgen-large
 lora_temperature=2
@@ -273,6 +286,7 @@ if [[ "$lora_distill" == true ]]; then
     require_positive_number --temperature "$lora_temperature"
     require_positive_number --kd-weight "$lora_kd_weight"
     require_nonnegative_number --ce-weight "$lora_ce_weight"
+    verify_distillation_support
 fi
 
 lora_total_updates=$((lora_epochs * lora_updates_per_epoch))
@@ -330,18 +344,18 @@ dora_args=(
 
 if [[ "$lora_distill" == true ]]; then
     dora_args+=(
-        transformer_lm.lora.condition_gated=false
-        distillation.enabled=true
-        "distillation.teacher_checkpoint=${lora_teacher}"
-        "distillation.temperature=${lora_temperature}"
-        "distillation.kl_weight=${lora_kd_weight}"
-        "distillation.ce_weight=${lora_ce_weight}"
-        "distillation.cfg_branches=${lora_cfg_branches}"
+        ++transformer_lm.lora.condition_gated=false
+        ++distillation.enabled=true
+        "++distillation.teacher_checkpoint=${lora_teacher}"
+        "++distillation.temperature=${lora_temperature}"
+        "++distillation.kl_weight=${lora_kd_weight}"
+        "++distillation.ce_weight=${lora_ce_weight}"
+        "++distillation.cfg_branches=${lora_cfg_branches}"
     )
 else
     dora_args+=(
-        transformer_lm.lora.condition_gated=true
-        distillation.enabled=false
+        ++transformer_lm.lora.condition_gated=true
+        ++distillation.enabled=false
     )
 fi
 
