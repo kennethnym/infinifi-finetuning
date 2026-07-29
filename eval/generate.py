@@ -272,6 +272,7 @@ def load_adapter_metadata(directory: Path) -> dict[str, Any]:
     rank = lora.get("rank")
     alpha = lora.get("alpha")
     dropout = lora.get("dropout")
+    condition_gated = lora.get("condition_gated", True)
     targets = lora.get("targets")
     supported_targets = {
         "self_attention",
@@ -294,6 +295,10 @@ def load_adapter_metadata(directory: Path) -> dict[str, Any]:
         or not 0 <= dropout < 1
     ):
         raise RuntimeError("Adapter metadata has an invalid LoRA dropout")
+    if not isinstance(condition_gated, bool):
+        raise RuntimeError(
+            "Adapter metadata has an invalid LoRA condition_gated value"
+        )
     if (
         not isinstance(targets, list)
         or not targets

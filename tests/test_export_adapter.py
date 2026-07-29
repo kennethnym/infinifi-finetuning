@@ -106,6 +106,8 @@ class ExportAdapterTest(unittest.TestCase):
             )
 
         self.assertEqual(metadata["lora"]["rank"], 8)
+        self.assertTrue(metadata["lora"]["condition_gated"])
+        self.assertEqual(metadata["gate"]["source"], "condition_mask")
         self.assertEqual(metadata["trainable_parameters"], 160)
         self.assertEqual(metadata["base_model"], "facebook/musicgen-small")
         self.assertEqual(
@@ -115,6 +117,31 @@ class ExportAdapterTest(unittest.TestCase):
                 "transformer.layers.0.self_attn.lora_q.lora_b",
             },
         )
+
+    def test_preserves_always_active_adapter_gate(self) -> None:
+        package = self.checkpoint_package()
+        package["xp.cfg"]["transformer_lm"]["lora"]["condition_gated"] = False
+
+        config = export_adapter.normalize_lora_config(package)
+
+        self.assertFalse(config["condition_gated"])
+
+    def test_preserves_distillation_provenance(self) -> None:
+        package = self.checkpoint_package()
+        package["xp.cfg"]["distillation"] = {
+            "enabled": True,
+            "teacher_checkpoint": "facebook/musicgen-large",
+            "temperature": 2,
+            "kl_weight": 0.75,
+            "ce_weight": 0.25,
+            "cfg_branches": True,
+        }
+
+        config = export_adapter.normalize_distillation_config(package)
+
+        self.assertEqual(config["teacher_checkpoint"], "facebook/musicgen-large")
+        self.assertEqual(config["temperature"], 2)
+        self.assertTrue(config["cfg_branches"])
 
     def test_rejects_non_lora_checkpoint(self) -> None:
         package = self.checkpoint_package()

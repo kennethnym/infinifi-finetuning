@@ -161,8 +161,19 @@ python eval/generate.py \
 An adapter package contains `adapter.json` and `adapter_state.bin`. The
 generator verifies both files and their digest, loads the recorded
 `facebook/musicgen-small` base, injects the rank/configuration recorded in the
-manifest, and loads only the adapter tensors. Null-conditioned CFG rows bypass
-the adapter.
+manifest, and loads only the adapter tensors. Ordinary condition-gated adapters
+bypass null-conditioned CFG rows. Adapters trained with `--distill` are active
+on both CFG branches, and that behavior is preserved in `adapter.json`.
+
+To train the default rank-16 adapter against frozen MusicGen-Large token
+distributions:
+
+```bash
+bash train_lora.sh --distill
+```
+
+This uses masked teacher-to-student KL plus hard-token cross entropy. It does
+not update or package the Large teacher.
 
 Use distinct run names for rank, epoch, and CFG comparisons, for example
 `lora_r8_epoch1_cfg3` and `lora_r16_epoch1_cfg4`.

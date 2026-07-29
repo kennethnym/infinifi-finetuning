@@ -107,6 +107,11 @@ def normalize_lora_config(checkpoint_package: Mapping[str, Any]) -> dict[str, An
             "rank": int(nested_value(raw, "rank")),
             "alpha": float(nested_value(raw, "alpha")),
             "dropout": float(nested_value(raw, "dropout")),
+            "condition_gated": bool(
+                raw.get("condition_gated", True)
+                if isinstance(raw, Mapping)
+                else getattr(raw, "condition_gated", True)
+            ),
             "targets": list(nested_value(raw, "targets")),
         }
     except (TypeError, ValueError) as error:
@@ -124,6 +129,47 @@ def normalize_lora_config(checkpoint_package: Mapping[str, Any]) -> dict[str, An
     if not config["targets"] or unknown_targets:
         raise RuntimeError(
             f"Checkpoint contains invalid LoRA targets: {config['targets']}"
+        )
+    return config
+
+
+def normalize_distillation_config(
+    checkpoint_package: Mapping[str, Any],
+) -> dict[str, Any] | None:
+    try:
+        raw = nested_value(checkpoint_package["xp.cfg"], "distillation")
+    except (KeyError, RuntimeError):
+        return None
+    enabled = (
+        raw.get("enabled", False)
+        if isinstance(raw, Mapping)
+        else getattr(raw, "enabled", False)
+    )
+    if not enabled:
+        return None
+    try:
+        config = {
+            "teacher_checkpoint": str(
+                nested_value(raw, "teacher_checkpoint")
+            ).strip(),
+            "temperature": float(nested_value(raw, "temperature")),
+            "kl_weight": float(nested_value(raw, "kl_weight")),
+            "ce_weight": float(nested_value(raw, "ce_weight")),
+            "cfg_branches": bool(nested_value(raw, "cfg_branches")),
+        }
+    except (TypeError, ValueError) as error:
+        raise RuntimeError(
+            "Checkpoint contains an invalid distillation configuration"
+        ) from error
+    if not config["teacher_checkpoint"]:
+        raise RuntimeError("Checkpoint distillation teacher must be non-empty")
+    if not math.isfinite(config["temperature"]) or config["temperature"] <= 0:
+        raise RuntimeError("Checkpoint distillation temperature must be positive")
+    if not math.isfinite(config["kl_weight"]) or config["kl_weight"] <= 0:
+        raise RuntimeError("Checkpoint distillation KL weight must be positive")
+    if not math.isfinite(config["ce_weight"]) or config["ce_weight"] < 0:
+        raise RuntimeError(
+            "Checkpoint distillation CE weight must be non-negative"
         )
     return config
 
@@ -169,10 +215,11 @@ def expected_metadata(
     checkpoint_name: str,
     checkpoint_sha256: str,
     lora_config: dict[str, Any],
+    distillation_config: dict[str, Any] | None,
     trainable_parameters: int,
     weights_path: Path,
 ) -> dict[str, Any]:
-    return {
+    metadata = {
         "schema_version": 1,
         "format": "infinifi_musicgen_lora",
         "base_model": BASE_MODEL,
@@ -184,15 +231,25 @@ def expected_metadata(
             "sha256": checkpoint_sha256,
         },
         "lora": lora_config,
-        "gate": {
-            "source": "condition_mask",
-            "active_when": "any_condition_token",
-        },
+        "gate": (
+            {
+                "source": "condition_mask",
+                "active_when": "any_condition_token",
+            }
+            if lora_config["condition_gated"]
+            else {
+                "source": "adapter_load",
+                "active_when": "adapter_loaded",
+            }
+        ),
         "trainable_parameters": trainable_parameters,
         "files": {
             ADAPTER_WEIGHTS: file_metadata(weights_path),
         },
     }
+    if distillation_config is not None:
+        metadata["distillation"] = distillation_config
+    return metadata
 
 
 def validate_existing_export(
@@ -291,6 +348,7 @@ def export_adapter(
     checkpoint_sha256 = sha256_file(checkpoint_path)
     checkpoint_package = torch.load(checkpoint_path, map_location="cpu")
     lora_config = normalize_lora_config(checkpoint_package)
+    distillation_config = normalize_distillation_config(checkpoint_package)
     adapter_state = extract_adapter_state(checkpoint_package)
     trainable_parameters = parameter_count(adapter_state)
 
@@ -317,6 +375,7 @@ def export_adapter(
             checkpoint_name,
             checkpoint_sha256,
             lora_config,
+            distillation_config,
             trainable_parameters,
             weights_path,
         )

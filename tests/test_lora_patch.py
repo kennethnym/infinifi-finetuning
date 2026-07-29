@@ -48,8 +48,10 @@ class LoRAPatchIntegrationTest(unittest.TestCase):
             "diff --git a/audiocraft/modules/transformer.py b/audiocraft/modules/transformer.py",
             "diff --git a/audiocraft/models/lm.py b/audiocraft/models/lm.py",
             "diff --git a/audiocraft/solvers/musicgen.py b/audiocraft/solvers/musicgen.py",
+            "diff --git a/config/solver/musicgen/default.yaml b/config/solver/musicgen/default.yaml",
             "diff --git a/tests/modules/test_lora.py b/tests/modules/test_lora.py",
             "diff --git a/tests/models/test_lm_lora.py b/tests/models/test_lm_lora.py",
+            "diff --git a/tests/solvers/test_musicgen_distillation.py b/tests/solvers/test_musicgen_distillation.py",
         }
         self.assertTrue(
             expected_headers.issubset(set(patch.splitlines())),

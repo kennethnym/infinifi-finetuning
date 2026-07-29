@@ -49,6 +49,8 @@ class TrainLoRAScriptTest(unittest.TestCase):
             "transformer_lm.lora.rank=16",
             "transformer_lm.lora.alpha=16",
             "transformer_lm.lora.dropout=0.05",
+            "transformer_lm.lora.condition_gated=true",
+            "distillation.enabled=false",
             "optim.ema.use=false",
             "classifier_free_guidance.training_dropout=0",
             "conditioners.description.t5.word_dropout=0",
@@ -59,6 +61,59 @@ class TrainLoRAScriptTest(unittest.TestCase):
             "seed=2036",
         }
         self.assertTrue(expected.issubset(arguments), expected - arguments)
+
+    def test_maps_distillation_configuration_and_defaults_to_dora(self) -> None:
+        result = self.run_train(
+            "--distill",
+            "--epochs",
+            "1",
+            "--updates-per-epoch",
+            "10",
+            "--warmup-steps",
+            "1",
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        arguments = set(result.stdout.splitlines())
+        expected = {
+            "transformer_lm.lora.enabled=true",
+            "transformer_lm.lora.rank=16",
+            "transformer_lm.lora.alpha=16",
+            "transformer_lm.lora.condition_gated=false",
+            "dataset.batch_size=1",
+            "optim.lr=3e-5",
+            "distillation.enabled=true",
+            "distillation.teacher_checkpoint=facebook/musicgen-large",
+            "distillation.temperature=2",
+            "distillation.kl_weight=0.75",
+            "distillation.ce_weight=0.25",
+            "distillation.cfg_branches=true",
+        }
+        self.assertTrue(expected.issubset(arguments), expected - arguments)
+
+    def test_supports_conditional_only_distillation(self) -> None:
+        result = self.run_train(
+            "--distill",
+            "--conditional-only",
+            "--epochs",
+            "1",
+            "--updates-per-epoch",
+            "2",
+            "--warmup-steps",
+            "0",
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(
+            "distillation.cfg_branches=false",
+            result.stdout.splitlines(),
+        )
+
+    def test_rejects_zero_distillation_weight(self) -> None:
+        result = self.run_train("--distill", "--kd-weight", "0")
+
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("--kd-weight", result.stderr)
 
     def test_rejects_adapter_dropout_of_one(self) -> None:
         result = self.run_train("--adapter-dropout", "1")
@@ -76,6 +131,8 @@ class TrainLoRAScriptTest(unittest.TestCase):
         )
 
         self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("--distill", result.stdout)
+        self.assertIn("--teacher MODEL", result.stdout)
         self.assertIn("--rank N", result.stdout)
         self.assertIn("--adapter-dropout RATE", result.stdout)
 
