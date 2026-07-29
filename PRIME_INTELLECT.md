@@ -236,6 +236,21 @@ The package contains `adapter.json` and `adapter_state.bin`. It deliberately
 cannot be merged into the base weights because merging would also alter null
 conditioning.
 
+For inference-only scaling experiments, keep the exported package immutable
+and pass `--adapter-scale` to the evaluator. The scale defaults to `1.0`, is
+recorded in the locked run configuration, and multiplies every LoRA projection:
+
+```bash
+python eval/generate.py \
+  --model /checkpoints/infinifi-lora-r8-epoch1 \
+  --run-name lora_r8_epoch1_cfg3_scale033 \
+  --cfg-coef 3 \
+  --adapter-scale 0.3333333333
+```
+
+Use scale `0` for a base-model equivalence check. Non-default values are only
+accepted for LoRA adapter packages.
+
 ### Full-model fine-tuning (legacy)
 
 `train.sh` fine-tunes the pretrained `facebook/musicgen-small` model on the

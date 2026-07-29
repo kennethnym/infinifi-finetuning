@@ -288,6 +288,7 @@ def load_run(
     prompt_ids = config.get("prompt_ids")
     seeds = config.get("seeds")
     model_source = config.get("model_source")
+    adapter_scale = config.get("adapter_scale", 1.0)
     audiocraft_commit = config.get("audiocraft_commit")
     generation = config.get("generation")
     if (
@@ -306,6 +307,17 @@ def load_run(
         raise RuntimeError("Run config contains invalid seeds")
     if not isinstance(model_source, dict) or not model_source:
         raise RuntimeError("Run config contains an invalid model_source")
+    if (
+        isinstance(adapter_scale, bool)
+        or not isinstance(adapter_scale, (int, float))
+        or not math.isfinite(adapter_scale)
+        or adapter_scale < 0
+    ):
+        raise RuntimeError("Run config contains an invalid adapter_scale")
+    if model_source.get("type") != "lora_adapter" and adapter_scale != 1.0:
+        raise RuntimeError(
+            "Run config applies a non-default adapter_scale to a non-adapter model"
+        )
     if not isinstance(audiocraft_commit, str) or not audiocraft_commit:
         raise RuntimeError("Run config contains an invalid audiocraft_commit")
     if audiocraft_commit != AUDIOCRAFT_COMMIT:
@@ -1666,6 +1678,7 @@ def main() -> None:
                         else None
                     ),
                     "run_model_source": run_config.get("model_source"),
+                    "run_adapter_scale": run_config.get("adapter_scale", 1.0),
                 },
                 ensure_ascii=False,
                 indent=2,
@@ -1846,6 +1859,7 @@ def main() -> None:
         "scored_at_utc": datetime.now(timezone.utc).isoformat(),
         "device": device,
         "torch": torch.__version__,
+        "adapter_scale": run_config.get("adapter_scale", 1.0),
         "metrics": metric_results,
     }
     completion_path = run_dir / "score_config.json"

@@ -39,6 +39,7 @@ LOCAL_MODEL_FILES = ("state_dict.bin", "compression_state_dict.bin")
 ADAPTER_METADATA = "adapter.json"
 ADAPTER_WEIGHTS = "adapter_state.bin"
 ADAPTER_FILES = (ADAPTER_METADATA, ADAPTER_WEIGHTS)
+DEFAULT_ADAPTER_SCALE = 1.0
 
 
 def parse_args() -> argparse.Namespace:
@@ -81,6 +82,15 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=DEFAULT_GENERATION_PARAMS["cfg_coef"],
         help="Classifier-free guidance coefficient (default: 3.0).",
+    )
+    parser.add_argument(
+        "--adapter-scale",
+        type=float,
+        default=DEFAULT_ADAPTER_SCALE,
+        help=(
+            "Inference-only multiplier for LoRA projections "
+            "(default: 1.0; LoRA adapters only)."
+        ),
     )
     parser.add_argument(
         "--limit",
@@ -195,6 +205,8 @@ def validate_args(args: argparse.Namespace, prompt_count: int) -> Path:
         raise RuntimeError("--batch-size must be greater than zero")
     if not math.isfinite(args.cfg_coef) or args.cfg_coef <= 0:
         raise RuntimeError("--cfg-coef must be a finite positive number")
+    if not math.isfinite(args.adapter_scale) or args.adapter_scale < 0:
+        raise RuntimeError("--adapter-scale must be a finite non-negative number")
 
     runs_root = RUNS_ROOT.resolve()
     output_dir = (RUNS_ROOT / args.run_name).resolve()
@@ -404,16 +416,42 @@ def load_musicgen_model(
     return model
 
 
+def apply_adapter_scale(module: Any, scale: float) -> int:
+    try:
+        from audiocraft.modules.lora import GatedLoRAProjection
+    except ImportError as error:
+        raise RuntimeError(
+            "LoRA adapter scaling requires the patched AudioCraft build."
+        ) from error
+
+    projections = [
+        child
+        for child in module.modules()
+        if isinstance(child, GatedLoRAProjection)
+    ]
+    if not projections:
+        raise RuntimeError("Loaded LoRA model contains no adapter projections")
+    for projection in projections:
+        projection.scaling *= scale
+    return len(projections)
+
+
 def build_locked_config(
     args: argparse.Namespace,
     prompts: list[dict[str, Any]],
     prompt_sha256: str,
     model_source: dict[str, Any],
 ) -> dict[str, Any]:
+    if (
+        model_source.get("type") != "lora_adapter"
+        and args.adapter_scale != DEFAULT_ADAPTER_SCALE
+    ):
+        raise RuntimeError("--adapter-scale only applies to LoRA adapter models")
     return {
         "schema_version": 2,
         "run_name": args.run_name,
         "model_source": model_source,
+        "adapter_scale": args.adapter_scale,
         "audiocraft_commit": AUDIOCRAFT_COMMIT,
         "generator_sha256": sha256_file(Path(__file__).resolve()),
         "prompt_manifest": display_path(PROMPTS_PATH),
@@ -614,6 +652,15 @@ def generate(
         locked_config["model_source"],
         device,
     )
+    if locked_config["model_source"]["type"] == "lora_adapter":
+        projection_count = apply_adapter_scale(
+            model.lm,
+            locked_config["adapter_scale"],
+        )
+        print(
+            f"applied adapter scale {locked_config['adapter_scale']} "
+            f"to {projection_count} LoRA projections"
+        )
     model.set_generation_params(**locked_config["generation"])
 
     runtime_path = output_dir / "runtime.json"
