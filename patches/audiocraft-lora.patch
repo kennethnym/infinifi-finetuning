@@ -1,5 +1,5 @@
 diff --git a/audiocraft/models/lm.py b/audiocraft/models/lm.py
-index 3bd6810..6bf2997 100644
+index 3bd6810..92e87a2 100644
 --- a/audiocraft/models/lm.py
 +++ b/audiocraft/models/lm.py
 @@ -16,6 +16,7 @@ from torch import nn
@@ -34,10 +34,10 @@ index 3bd6810..6bf2997 100644
          self.out_norm: tp.Optional[nn.Module] = None
          if norm_first:
              self.out_norm = create_norm_fn(norm, dim)
-@@ -217,6 +221,23 @@ class LMModel(StreamingModule):
+@@ -217,6 +221,25 @@ class LMModel(StreamingModule):
      def num_codebooks(self) -> int:
          return self.n_q
- 
+
 +    def _adapter_gate(
 +        self,
 +        condition_tensors: ConditionTensors,
@@ -46,6 +46,8 @@ index 3bd6810..6bf2997 100644
 +    ) -> tp.Optional[torch.Tensor]:
 +        if not self.lora_config.enabled:
 +            return None
++        if not self.lora_config.condition_gated:
++            return torch.ones(batch_size, dtype=torch.bool, device=device)
 +        gate = torch.zeros(batch_size, dtype=torch.bool, device=device)
 +        for _, mask in condition_tensors.values():
 +            if mask.shape[0] != batch_size:
@@ -58,13 +60,13 @@ index 3bd6810..6bf2997 100644
      def forward(self, sequence: torch.Tensor,
                  conditions: tp.List[ConditioningAttributes],
                  condition_tensors: tp.Optional[ConditionTensors] = None,
-@@ -252,10 +273,12 @@ class LMModel(StreamingModule):
+@@ -252,10 +275,12 @@ class LMModel(StreamingModule):
          else:
              assert not conditions, "Shouldn't pass both conditions and condition_tensors."
- 
+
 +        adapter_gate = self._adapter_gate(condition_tensors, B, input_.device)
          input_, cross_attention_input = self.fuser(input_, condition_tensors)
- 
+
          out = self.transformer(input_, cross_attention_src=cross_attention_input,
 -                               src_mask=(self.attn_mask_per_stage[stage] if stage >= 0 else None))
 +                               src_mask=(self.attn_mask_per_stage[stage] if stage >= 0 else None),
@@ -74,10 +76,10 @@ index 3bd6810..6bf2997 100644
          logits = torch.stack([self.linears[k](out) for k in range(K)], dim=1)  # [B, K, S, card]
 diff --git a/audiocraft/modules/lora.py b/audiocraft/modules/lora.py
 new file mode 100644
-index 0000000..9d16540
+index 0000000..eef0791
 --- /dev/null
 +++ b/audiocraft/modules/lora.py
-@@ -0,0 +1,192 @@
+@@ -0,0 +1,195 @@
 +# Copyright (c) Meta Platforms, Inc. and affiliates.
 +# All rights reserved.
 +#
@@ -109,6 +111,7 @@ index 0000000..9d16540
 +    rank: int = 8
 +    alpha: float = 8.0
 +    dropout: float = 0.0
++    condition_gated: bool = True
 +    targets: tp.Tuple[str, ...] = tuple(sorted(SUPPORTED_TARGETS))
 +
 +    @classmethod
@@ -121,6 +124,7 @@ index 0000000..9d16540
 +            rank=int(config.get("rank", 8)),
 +            alpha=float(config.get("alpha", config.get("rank", 8))),
 +            dropout=float(config.get("dropout", 0.0)),
++            condition_gated=bool(config.get("condition_gated", True)),
 +            targets=targets,
 +        )
 +        value.validate()
@@ -148,6 +152,7 @@ index 0000000..9d16540
 +            "rank": self.rank,
 +            "alpha": self.alpha,
 +            "dropout": self.dropout,
++            "condition_gated": self.condition_gated,
 +            "targets": list(self.targets),
 +        }
 +
@@ -277,11 +282,11 @@ index 4d44b39..6d09770 100644
 @@ -22,6 +22,7 @@ from torch.nn import functional as F
  from torch.utils.checkpoint import checkpoint as torch_checkpoint
  from xformers import ops
- 
+
 +from .lora import GatedLoRAProjection, LoRAConfig
  from .rope import RotaryEmbedding
  from .streaming import StreamingModule
- 
+
 @@ -183,6 +184,11 @@ class StreamingMultiheadAttention(StreamingModule):
          self.num_heads = num_heads
          self.dropout = dropout
@@ -297,7 +302,7 @@ index 4d44b39..6d09770 100644
 @@ -221,6 +227,27 @@ class StreamingMultiheadAttention(StreamingModule):
              self.q_layer_norm = nn.LayerNorm(ln_dim)
              self.k_layer_norm = nn.LayerNorm(ln_dim)
- 
+
 +    def _enable_lora(self, config: LoRAConfig) -> None:
 +        if self.lora_q is not None:
 +            return
@@ -323,7 +328,7 @@ index 4d44b39..6d09770 100644
          if not self.custom:
              # Support compat with regular MHA
 @@ -314,7 +341,8 @@ class StreamingMultiheadAttention(StreamingModule):
- 
+
      def forward(self, query: torch.Tensor, key: torch.Tensor, value: torch.Tensor,
                  key_padding_mask=None, need_weights=False, attn_mask=None,
 -                average_attn_weights=True, is_causal=False):
@@ -331,7 +336,7 @@ index 4d44b39..6d09770 100644
 +                adapter_gate: tp.Optional[torch.Tensor] = None):
          assert not is_causal, ("New param added in torch 2.0.1 not supported, "
                                 "use the causal args in the constructor.")
- 
+
 @@ -355,6 +383,11 @@ class StreamingMultiheadAttention(StreamingModule):
                  # todo: when streaming, we could actually save k, v and check the shape actually match.
                  k = nn.functional.linear(key, self.in_proj_weight[dim: 2 * dim], bias_k)
@@ -388,7 +393,7 @@ index 4d44b39..6d09770 100644
 +        self.lora_linear1: tp.Optional[GatedLoRAProjection] = None
 +        self.lora_linear2: tp.Optional[GatedLoRAProjection] = None
 +        self._lora_config = LoRAConfig()
- 
+
          self.layer_scale_1: nn.Module
          self.layer_scale_2: nn.Module
 @@ -538,18 +586,84 @@ class StreamingTransformerLayer(nn.TransformerEncoderLayer):
@@ -458,7 +463,7 @@ index 4d44b39..6d09770 100644
 +        if self.lora_linear2 is not None:
 +            output = output + self.lora_linear2(hidden, adapter_gate)
 +        return self.dropout2(output)
- 
+
      def _cross_attention_block(self, src: torch.Tensor,
 -                               cross_attention_src: torch.Tensor) -> torch.Tensor:
 +                               cross_attention_src: torch.Tensor,
@@ -470,7 +475,7 @@ index 4d44b39..6d09770 100644
 +            src, cross_attention_src, cross_attention_src, need_weights=False,
 +            adapter_gate=adapter_gate)[0]
          return self.dropout_cross(x)  # type: ignore
- 
+
      def forward(self, src: torch.Tensor, src_mask: tp.Optional[torch.Tensor] = None,  # type: ignore
                  src_key_padding_mask: tp.Optional[torch.Tensor] = None,
 -                cross_attention_src: tp.Optional[torch.Tensor] = None):
@@ -510,24 +515,64 @@ index 4d44b39..6d09770 100644
 +                x + self.layer_scale_2(
 +                    self._feedforward_block(x, adapter_gate)))
          return x
- 
- 
+
+
 diff --git a/audiocraft/solvers/musicgen.py b/audiocraft/solvers/musicgen.py
-index 72b6533..a2dd759 100644
+index 72b6533..0b5daf2 100644
 --- a/audiocraft/solvers/musicgen.py
 +++ b/audiocraft/solvers/musicgen.py
-@@ -23,6 +23,7 @@ from ..data.audio_dataset import AudioDataset
+@@ -22,7 +22,15 @@ from .. import models
+ from ..data.audio_dataset import AudioDataset
  from ..data.music_dataset import MusicDataset, MusicInfo, AudioInfo
  from ..data.audio_utils import normalize_audio
- from ..modules.conditioners import JointEmbedCondition, SegmentWithAttributes, WavCondition
+-from ..modules.conditioners import JointEmbedCondition, SegmentWithAttributes, WavCondition
++from ..modules.conditioners import (
++    ClassifierFreeGuidanceDropout,
++    ConditionType,
++    ConditioningAttributes,
++    JointEmbedCondition,
++    SegmentWithAttributes,
++    WavCondition,
++)
 +from ..modules.lora import mark_only_lora_as_trainable
  from ..utils.cache import CachedBatchWriter, CachedBatchLoader
  from ..utils.samples.manager import SampleManager
  from ..utils.utils import get_dataset_from_loader, is_jsonable, warn_once, model_hash
-@@ -136,12 +137,26 @@ class MusicGenSolver(base.StandardSolver):
+@@ -44,7 +52,14 @@ class MusicGenSolver(base.StandardSolver):
+             'top_k': self.cfg.generate.lm.top_k,
+             'top_p': self.cfg.generate.lm.top_p,
+         }
+-        self._best_metric_name: tp.Optional[str] = 'ce'
++        distillation_cfg = self.cfg.get('distillation', None)
++        distillation_enabled = (
++            distillation_cfg is not None
++            and bool(distillation_cfg.get('enabled', False))
++        )
++        self._best_metric_name: tp.Optional[str] = (
++            'loss' if distillation_enabled else 'ce'
++        )
+
+         self._cached_batch_writer = None
+         self._cached_batch_loader = None
+@@ -101,10 +116,12 @@ class MusicGenSolver(base.StandardSolver):
+     def get_formatter(self, stage_name: str) -> flashy.Formatter:
+         return flashy.Formatter({
+             'lr': '.2E',
++            'loss': '.3f',
++            'kd': '.3f',
+             'ce': '.3f',
+             'ppl': '.3f',
+             'grad_norm': '.3E',
+-        }, exclude_keys=['ce_q*', 'ppl_q*'])
++        }, exclude_keys=['ce_q*', 'ppl_q*', 'kd_q*'])
+
+     @property
+     def best_metric_name(self) -> tp.Optional[str]:
+@@ -136,12 +153,86 @@ class MusicGenSolver(base.StandardSolver):
                           self.compression_model.frame_rate)
          # instantiate LM model
          self.model: models.LMModel = models.builders.get_lm_model(self.cfg).to(self.device)
++        self.teacher_model: tp.Optional[models.LMModel] = None
 +        optimizer_parameters = None
 +        if self.model.lora_config.enabled:
 +            if self.cfg.fsdp.use:
@@ -540,6 +585,65 @@ index 72b6533..a2dd759 100644
 +            optimizer_parameters = mark_only_lora_as_trainable(self.model)
 +            trainable = sum(parameter.numel() for parameter in optimizer_parameters)
 +            self.logger.info("Training MusicGen with %.2f M LoRA parameters.", trainable / 1e6)
++        distillation_cfg = self.cfg.get('distillation', None)
++        if (
++            distillation_cfg is not None
++            and bool(distillation_cfg.get('enabled', False))
++        ):
++            if not self.model.lora_config.enabled:
++                raise ValueError("MusicGen distillation requires LoRA to be enabled.")
++            if distillation_cfg.temperature <= 0:
++                raise ValueError("Distillation temperature must be positive.")
++            if distillation_cfg.kl_weight <= 0:
++                raise ValueError("Distillation KL weight must be positive.")
++            if distillation_cfg.ce_weight < 0:
++                raise ValueError("Distillation CE weight must be non-negative.")
++            teacher_checkpoint = str(distillation_cfg.teacher_checkpoint).strip()
++            if not teacher_checkpoint:
++                raise ValueError("Distillation teacher checkpoint must be non-empty.")
++            if (
++                distillation_cfg.cfg_branches
++                and self.model.lora_config.condition_gated
++            ):
++                raise ValueError(
++                    "CFG-branch distillation requires LoRA condition_gated=false."
++                )
++            if (
++                distillation_cfg.cfg_branches
++                and self.cfg.classifier_free_guidance.training_dropout != 0
++            ):
++                raise ValueError(
++                    "CFG-branch distillation requires training_dropout=0 because "
++                    "conditional and unconditional branches are built explicitly."
++                )
++            self.logger.info(
++                "Loading frozen MusicGen distillation teacher from %s.",
++                teacher_checkpoint,
++            )
++            self.teacher_model = models.loaders.load_lm_model(
++                teacher_checkpoint, device=self.device)
++            self.teacher_model.requires_grad_(False)
++            self.teacher_model.eval()
++            if self.teacher_model.card != self.model.card:
++                raise ValueError(
++                    "Teacher and student token cardinalities do not match: "
++                    f"{self.teacher_model.card} vs {self.model.card}."
++                )
++            if self.teacher_model.num_codebooks != self.model.num_codebooks:
++                raise ValueError(
++                    "Teacher and student codebook counts do not match: "
++                    f"{self.teacher_model.num_codebooks} vs {self.model.num_codebooks}."
++                )
++            teacher_parameters = sum(
++                parameter.numel() for parameter in self.teacher_model.parameters())
++            self.logger.info(
++                "Distilling from frozen %.2f B parameter teacher with "
++                "temperature %.2f, KL weight %.3f, and CE weight %.3f.",
++                teacher_parameters / 1e9,
++                distillation_cfg.temperature,
++                distillation_cfg.kl_weight,
++                distillation_cfg.ce_weight,
++            )
          if self.cfg.fsdp.use:
              assert not self.cfg.autocast, "Cannot use autocast with fsdp"
              self.model = self.wrap_with_fsdp(self.model)
@@ -552,11 +656,164 @@ index 72b6533..a2dd759 100644
          self.lr_scheduler = builders.get_lr_scheduler(self.optimizer, self.cfg.schedule, self.total_updates)
          self.register_stateful('model', 'optimizer', 'lr_scheduler')
          self.register_best_state('model')
+@@ -243,6 +334,91 @@ class MusicGenSolver(base.StandardSolver):
+         ce = ce / K
+         return ce, ce_per_codebook
+
++    def _compute_distillation_kl(
++        self,
++        student_logits: torch.Tensor,
++        teacher_logits: torch.Tensor,
++        mask: torch.Tensor,
++    ) -> tp.Tuple[torch.Tensor, tp.List[torch.Tensor]]:
++        """Compute temperature-scaled KL(teacher || student) per codebook."""
++        if student_logits.shape != teacher_logits.shape:
++            raise ValueError(
++                "Teacher and student logit shapes do not match: "
++                f"{tuple(teacher_logits.shape)} vs {tuple(student_logits.shape)}."
++            )
++        if student_logits.shape[:-1] != mask.shape:
++            raise ValueError(
++                "Distillation mask shape does not match the logits: "
++                f"{tuple(mask.shape)} vs {tuple(student_logits.shape)}."
++            )
++        temperature = float(self.cfg.distillation.temperature)
++        codebooks = student_logits.shape[1]
++        kd = torch.zeros([], device=student_logits.device, dtype=torch.float32)
++        kd_per_codebook: tp.List[torch.Tensor] = []
++        for codebook in range(codebooks):
++            codebook_mask = mask[:, codebook].reshape(-1)
++            student = student_logits[:, codebook].reshape(
++                -1, student_logits.shape[-1])[codebook_mask].float()
++            teacher = teacher_logits[:, codebook].reshape(
++                -1, teacher_logits.shape[-1])[codebook_mask].float()
++            teacher_probabilities = F.softmax(teacher / temperature, dim=-1)
++            student_log_probabilities = F.log_softmax(
++                student / temperature, dim=-1)
++            codebook_kd = F.kl_div(
++                student_log_probabilities,
++                teacher_probabilities,
++                reduction='batchmean',
++            ) * (temperature ** 2)
++            kd += codebook_kd
++            kd_per_codebook.append(codebook_kd.detach())
++        return kd / codebooks, kd_per_codebook
++
++    @staticmethod
++    def _concatenate_condition_tensors(
++        conditional: tp.Dict[str, ConditionType],
++        unconditional: tp.Dict[str, ConditionType],
++    ) -> tp.Dict[str, ConditionType]:
++        if conditional.keys() != unconditional.keys():
++            raise ValueError(
++                "Conditional and unconditional conditioner keys do not match."
++            )
++        return {
++            key: (
++                torch.cat([conditional[key][0], unconditional[key][0]], dim=0),
++                torch.cat([conditional[key][1], unconditional[key][1]], dim=0),
++            )
++            for key in conditional
++        }
++
++    def _distillation_attributes(
++        self,
++        batch: tp.Tuple[torch.Tensor, tp.List[SegmentWithAttributes]],
++    ) -> tp.List[ConditioningAttributes]:
++        infos = batch[-1]
++        if not isinstance(infos, list) or not all(
++            isinstance(info, SegmentWithAttributes) for info in infos
++        ):
++            raise ValueError(
++                "Distillation requires segment metadata for every audio sample."
++            )
++        return [info.to_condition_attributes() for info in infos]
++
++    def _teacher_predictions(
++        self,
++        audio_tokens: torch.Tensor,
++        attributes: tp.List[ConditioningAttributes],
++    ):
++        if self.teacher_model is None:
++            raise RuntimeError("Distillation teacher is not loaded.")
++        self.teacher_model.eval()
++        with torch.no_grad(), self.autocast:
++            teacher_tokenized = self.teacher_model.condition_provider.tokenize(
++                attributes)
++            teacher_conditions = self.teacher_model.condition_provider(
++                teacher_tokenized)
++            return self.teacher_model.compute_predictions(
++                audio_tokens, [], teacher_conditions)
++
+     def _prepare_tokens_and_attributes(
+         self, batch: tp.Tuple[torch.Tensor, tp.List[SegmentWithAttributes]],
+         check_synchronization_points: bool = False
+@@ -361,12 +537,47 @@ class MusicGenSolver(base.StandardSolver):
+         if check_synchronization_points:
+             torch.cuda.set_sync_debug_mode('warn')
+
++        teacher_output = None
++        if self.teacher_model is not None:
++            teacher_attributes = self._distillation_attributes(batch)
++            if self.cfg.distillation.cfg_branches:
++                null_attributes = ClassifierFreeGuidanceDropout(p=1.0)(
++                    teacher_attributes)
++                with self.autocast:
++                    null_tokenized = self.model.condition_provider.tokenize(
++                        null_attributes)
++                    null_conditions = self.model.condition_provider(null_tokenized)
++                condition_tensors = self._concatenate_condition_tensors(
++                    condition_tensors, null_conditions)
++                teacher_attributes = teacher_attributes + null_attributes
++                audio_tokens = torch.cat([audio_tokens, audio_tokens], dim=0)
++                padding_mask = torch.cat([padding_mask, padding_mask], dim=0)
++            teacher_output = self._teacher_predictions(
++                audio_tokens, teacher_attributes)
++            self.deadlock_detect.update('teacher')
++
+         with self.autocast:
+             model_output = self.model.compute_predictions(audio_tokens, [], condition_tensors)  # type: ignore
+             logits = model_output.logits
+             mask = padding_mask & model_output.mask
+             ce, ce_per_codebook = self._compute_cross_entropy(logits, audio_tokens, mask)
+-            loss = ce
++            if teacher_output is None:
++                loss = ce
++                kd = None
++                kd_per_codebook = []
++            else:
++                if model_output.mask.shape != teacher_output.mask.shape:
++                    raise ValueError(
++                        "Teacher and student codebook prediction mask shapes do not match."
++                    )
++                mask &= teacher_output.mask
++                kd, kd_per_codebook = self._compute_distillation_kl(
++                    logits, teacher_output.logits, mask)
++                loss = (
++                    float(self.cfg.distillation.kl_weight) * kd
++                    + float(self.cfg.distillation.ce_weight) * ce
++                )
++        objective = loss
+         self.deadlock_detect.update('loss')
+
+         if check_synchronization_points:
+@@ -416,6 +627,11 @@ class MusicGenSolver(base.StandardSolver):
+
+         metrics['ce'] = ce
+         metrics['ppl'] = torch.exp(ce)
++        if kd is not None:
++            metrics['loss'] = objective.detach()
++            metrics['kd'] = kd.detach()
++            for k, kd_q in enumerate(kd_per_codebook):
++                metrics[f'kd_q{k + 1}'] = kd_q
+         for k, ce_q in enumerate(ce_per_codebook):
+             metrics[f'ce_q{k + 1}'] = ce_q
+             metrics[f'ppl_q{k + 1}'] = torch.exp(ce_q)
 diff --git a/config/model/lm/default.yaml b/config/model/lm/default.yaml
-index 2d256ad..288e985 100644
+index 2d256ad..4d86e53 100644
 --- a/config/model/lm/default.yaml
 +++ b/config/model/lm/default.yaml
-@@ -45,3 +45,9 @@ transformer_lm:
+@@ -45,3 +45,10 @@ transformer_lm:
    attention_dropout: null
    kv_repeat: 1
    two_step_cfg: false          # whether to do true 2 steps CFG, potentially resolving some padding issues or not...
@@ -565,13 +822,33 @@ index 2d256ad..288e985 100644
 +    rank: 8
 +    alpha: 8
 +    dropout: 0.0
++    condition_gated: true
 +    targets: [self_attention, cross_attention, feedforward]
+diff --git a/config/solver/musicgen/default.yaml b/config/solver/musicgen/default.yaml
+index 8bdf9c7..5571b6a 100644
+--- a/config/solver/musicgen/default.yaml
++++ b/config/solver/musicgen/default.yaml
+@@ -34,6 +34,14 @@ cache:
+   write_shard: 0
+   write_num_shards: 1
+
++distillation:
++  enabled: false
++  teacher_checkpoint: facebook/musicgen-large
++  temperature: 2.0
++  kl_weight: 0.75
++  ce_weight: 0.25
++  cfg_branches: true
++
+
+ dataset:
+   batch_size: 128
 diff --git a/tests/models/test_lm_lora.py b/tests/models/test_lm_lora.py
 new file mode 100644
-index 0000000..de23379
+index 0000000..2322edd
 --- /dev/null
 +++ b/tests/models/test_lm_lora.py
-@@ -0,0 +1,27 @@
+@@ -0,0 +1,48 @@
 +from types import SimpleNamespace
 +
 +import torch
@@ -599,12 +876,33 @@ index 0000000..de23379
 +        model, condition_tensors, batch_size=3, device=torch.device("cpu"))
 +
 +    assert torch.equal(gate, torch.tensor([True, True, False]))
++
++
++def test_adapter_gate_can_be_independent_of_condition_masks():
++    model = SimpleNamespace(
++        lora_config=LoRAConfig.from_dict({
++            "enabled": True,
++            "rank": 2,
++            "condition_gated": False,
++        })
++    )
++    condition_tensors = {
++        "description": (
++            torch.zeros(2, 1, 4),
++            torch.zeros(2, 1),
++        ),
++    }
++
++    gate = LMModel._adapter_gate(
++        model, condition_tensors, batch_size=2, device=torch.device("cpu"))
++
++    assert torch.equal(gate, torch.tensor([True, True]))
 diff --git a/tests/modules/test_lora.py b/tests/modules/test_lora.py
 new file mode 100644
-index 0000000..fc776cb
+index 0000000..90512a2
 --- /dev/null
 +++ b/tests/modules/test_lora.py
-@@ -0,0 +1,97 @@
+@@ -0,0 +1,102 @@
 +import pytest
 +import torch
 +
@@ -634,6 +932,11 @@ index 0000000..fc776cb
 +        LoRAConfig.from_dict({"enabled": True, "rank": 0})
 +    with pytest.raises(ValueError, match="targets"):
 +        LoRAConfig.from_dict({"enabled": True, "targets": ["unknown"]})
++    assert LoRAConfig.from_dict({"enabled": True}).condition_gated
++    assert not LoRAConfig.from_dict({
++        "enabled": True,
++        "condition_gated": False,
++    }).condition_gated
 +
 +
 +def test_zero_initialization_and_per_sample_null_gate():
@@ -702,3 +1005,96 @@ index 0000000..fc776cb
 +        dim_feedforward=64, dropout=0.0)
 +    inject_lora(model, lora_config())
 +    assert adapter_state_dict(model)
+diff --git a/tests/solvers/test_musicgen_distillation.py b/tests/solvers/test_musicgen_distillation.py
+new file mode 100644
+index 0000000..efa88b8
+--- /dev/null
++++ b/tests/solvers/test_musicgen_distillation.py
+@@ -0,0 +1,87 @@
++from types import SimpleNamespace
++
++import pytest
++import torch
++
++from audiocraft.solvers.musicgen import MusicGenSolver
++
++
++def solver(temperature=2.0):
++    return SimpleNamespace(
++        cfg=SimpleNamespace(
++            distillation=SimpleNamespace(temperature=temperature)
++        )
++    )
++
++
++def test_distillation_kl_is_zero_for_identical_logits():
++    logits = torch.tensor([
++        [
++            [[2.0, 1.0, -1.0], [0.5, 0.0, -0.5]],
++            [[1.0, 0.0, -1.0], [3.0, 2.0, 1.0]],
++        ],
++    ])
++    mask = torch.ones(logits.shape[:-1], dtype=torch.bool)
++
++    kd, per_codebook = MusicGenSolver._compute_distillation_kl(
++        solver(), logits, logits.clone(), mask)
++
++    assert kd.item() == pytest.approx(0.0, abs=1e-6)
++    assert len(per_codebook) == 2
++
++
++def test_distillation_kl_ignores_masked_positions_and_backpropagates():
++    teacher = torch.tensor([
++        [
++            [[3.0, 0.0], [100.0, -100.0]],
++            [[0.0, 3.0], [-100.0, 100.0]],
++        ],
++    ])
++    student = torch.tensor([
++        [
++            [[0.0, 3.0], [-100.0, 100.0]],
++            [[3.0, 0.0], [100.0, -100.0]],
++        ],
++    ], requires_grad=True)
++    mask = torch.tensor([[[True, False], [True, False]]])
++
++    kd, _ = MusicGenSolver._compute_distillation_kl(
++        solver(), student, teacher, mask)
++    kd.backward()
++
++    assert kd.item() > 0
++    assert student.grad is not None
++    assert student.grad[:, :, 0].abs().sum().item() > 0
++    assert student.grad[:, :, 1].abs().sum().item() == 0
++
++
++def test_distillation_kl_rejects_incompatible_logits():
++    student = torch.zeros(1, 2, 3, 4)
++    teacher = torch.zeros(1, 2, 3, 5)
++    mask = torch.ones(1, 2, 3, dtype=torch.bool)
++
++    with pytest.raises(ValueError, match="logit shapes"):
++        MusicGenSolver._compute_distillation_kl(
++            solver(), student, teacher, mask)
++
++
++def test_condition_tensors_are_concatenated_by_branch():
++    conditional = {
++        "description": (
++            torch.tensor([[[1.0]]]),
++            torch.tensor([[1]]),
++        ),
++    }
++    unconditional = {
++        "description": (
++            torch.tensor([[[0.0]]]),
++            torch.tensor([[0]]),
++        ),
++    }
++
++    combined = MusicGenSolver._concatenate_condition_tensors(
++        conditional, unconditional)
++
++    values, mask = combined["description"]
++    assert values[:, 0, 0].tolist() == [1.0, 0.0]
++    assert mask[:, 0].tolist() == [1, 0]

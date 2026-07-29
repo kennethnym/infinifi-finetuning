@@ -79,7 +79,7 @@ python prepare.py \
   --valid-count 750 \
   --clap-batch-size 32
 bash train_lora.sh \
-  --rank 8 \
+  --distill \
   --epochs 1 \
   --updates-per-epoch 10 \
   --segment-duration 5 \
@@ -87,9 +87,9 @@ bash train_lora.sh \
   --evaluate-samples 4 \
   --generate-samples 1
 DORA_SIGNATURE=aec31258  # Replace with the signature printed by Dora.
-python export_adapter.py --signature "$DORA_SIGNATURE" --output-dir /checkpoints/infinifi-lora-r8
-python eval/generate.py --model /checkpoints/infinifi-lora-r8 --run-name lora_r8 --dry-run
-python eval/generate.py --model /checkpoints/infinifi-lora-r8 --run-name lora_r8
+python export_adapter.py --signature "$DORA_SIGNATURE" --output-dir /checkpoints/infinifi-lora-kd-r16
+python eval/generate.py --model /checkpoints/infinifi-lora-kd-r16 --run-name lora_kd_r16 --dry-run
+python eval/generate.py --model /checkpoints/infinifi-lora-kd-r16 --run-name lora_kd_r16
 ```
 
 Run the baseline generator before fine-tuning. It writes the plain
@@ -102,8 +102,9 @@ AudioCraft/Dora writes training runs according to its default grid and cache
 configuration. After adapter training, pass the Dora signature to
 `export_adapter.py`. The adapter package records the pinned base model and
 contains only LoRA tensors; `eval/generate.py` loads the base model, injects
-the adapter, and applies it only to conditioned CFG rows. The example writes
-to the distinct `/workspace/runs/lora_r8` run directory.
+the adapter, and restores its recorded gating mode. The distilled adapter in
+the example is active on both conditional and unconditional CFG rows and
+writes to the distinct `/workspace/runs/lora_kd_r16` run directory.
 
 ### Dataset curation
 
@@ -209,9 +210,10 @@ python eval/generate.py \
 
 `train_lora.sh` freezes MusicGen, T5, and EnCodec and trains gated LoRA
 projections in every self-attention, cross-attention, and feed-forward block.
-The adapter is disabled per sample when every conditioning mask is empty, so
-the CFG null branch remains the exact pretrained model. The defaults run 1,500
-updates with rank 8, alpha 8, adapter dropout 0.05, and learning rate `1e-4`:
+Without `--distill`, the adapter is disabled per sample when every conditioning
+mask is empty, so the CFG null branch remains the exact pretrained model. The
+ordinary LoRA defaults run 1,500 updates with rank 8, alpha 8, adapter dropout
+0.05, and learning rate `1e-4`:
 
 ```bash
 bash train_lora.sh --rank 8
@@ -223,6 +225,27 @@ to the selected rank, and both runs use seed 2036. Classifier-free, T5 word,
 and metadata dropout are disabled so rank is the controlled variable.
 Full-model EMA and FSDP are not supported by this adapter path.
 
+For teacher-student distillation, add `--distill`. The solver loads
+`facebook/musicgen-large` as a frozen teacher and feeds the teacher and student
+the same prompt and EnCodec prefix. It minimizes a temperature-scaled,
+codebook-masked `KL(teacher || student)` loss mixed with the existing hard-token
+cross entropy. Only the Small model's LoRA tensors receive optimizer updates:
+
+```bash
+bash train_lora.sh --distill
+```
+
+Distillation defaults change to rank 16, batch size 1, and learning rate
+`3e-5`; the loss defaults to `0.75 * KD + 0.25 * CE` at temperature 2.
+Conditional and unconditional branches are explicitly distilled, so the
+adapter is active on both CFG rows whenever it is loaded. Use
+`--conditional-only` only for an intentional ablation. Loading Large alongside
+the student raises accelerator memory use substantially; reduce segment
+duration before changing the loss if the run is memory constrained.
+
+Run `bash train_lora.sh --help` for teacher, temperature, loss-weight, rank,
+batch, and scheduling controls.
+
 Export each rank or periodic epoch to its own immutable package:
 
 ```bash
@@ -232,9 +255,10 @@ python export_adapter.py \
   --output-dir /checkpoints/infinifi-lora-r8-epoch1
 ```
 
-The package contains `adapter.json` and `adapter_state.bin`. It deliberately
-cannot be merged into the base weights because merging would also alter null
-conditioning.
+The package contains `adapter.json` and `adapter_state.bin`. Its metadata
+records whether activation follows the condition mask or adapter loading.
+Condition-gated adapters deliberately cannot be merged into the base weights
+because merging would also alter null conditioning.
 
 For inference-only scaling experiments, keep the exported package immutable
 and pass `--adapter-scale` to the evaluator. The scale defaults to `1.0`, is

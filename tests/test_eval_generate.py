@@ -220,7 +220,7 @@ class EvalGenerateTest(unittest.TestCase):
         modules_module = ModuleType("audiocraft.modules")
         lora_module = ModuleType("audiocraft.modules.lora")
         lora_module.inject_lora = (
-            lambda lm, config: calls.append(("inject", lm, config["rank"]))
+            lambda lm, config: calls.append(("inject", lm, dict(config)))
         )
         lora_module.load_adapter_state_dict = (
             lambda lm, state: calls.append(("load", lm, state))
@@ -241,7 +241,11 @@ class EvalGenerateTest(unittest.TestCase):
                 {
                     "type": "lora_adapter",
                     "base_model": "facebook/musicgen-small",
-                    "lora": {"enabled": True, "rank": 8},
+                    "lora": {
+                        "enabled": True,
+                        "rank": 16,
+                        "condition_gated": False,
+                    },
                 },
                 "cpu",
             )
@@ -249,6 +253,8 @@ class EvalGenerateTest(unittest.TestCase):
         self.assertIs(loaded, model)
         self.assertEqual(calls[0], ("base", "facebook/musicgen-small", "cpu"))
         self.assertEqual(calls[1][0], "inject")
+        self.assertEqual(calls[1][2]["rank"], 16)
+        self.assertFalse(calls[1][2]["condition_gated"])
         self.assertEqual(calls[2][0], "load")
         self.assertEqual(calls[3], "eval")
 
