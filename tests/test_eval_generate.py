@@ -72,6 +72,7 @@ class EvalGenerateTest(unittest.TestCase):
             model="model",
             batch_size=0,
             cfg_coef=3.0,
+            adapter_scale=1.0,
         )
 
         with self.assertRaisesRegex(
@@ -87,6 +88,7 @@ class EvalGenerateTest(unittest.TestCase):
             model="model",
             batch_size=1,
             cfg_coef=float("inf"),
+            adapter_scale=1.0,
         )
 
         with self.assertRaisesRegex(
@@ -94,12 +96,29 @@ class EvalGenerateTest(unittest.TestCase):
         ):
             generate.validate_args(args, prompt_count=1)
 
-    def test_locks_requested_cfg_coefficient(self) -> None:
+    def test_rejects_invalid_adapter_scale(self) -> None:
+        args = SimpleNamespace(
+            run_name="test-run",
+            limit=None,
+            seeds=[42],
+            model="model",
+            batch_size=1,
+            cfg_coef=3.0,
+            adapter_scale=-0.1,
+        )
+
+        with self.assertRaisesRegex(
+            RuntimeError, "--adapter-scale must be a finite non-negative number"
+        ):
+            generate.validate_args(args, prompt_count=1)
+
+    def test_locks_requested_cfg_coefficient_and_adapter_scale(self) -> None:
         args = SimpleNamespace(
             run_name="test-run",
             seeds=[42],
             batch_size=1,
             cfg_coef=5.0,
+            adapter_scale=0.25,
         )
 
         with mock.patch.object(generate, "sha256_file", return_value="digest"):
@@ -107,11 +126,31 @@ class EvalGenerateTest(unittest.TestCase):
                 args,
                 [{"id": "prompt-0"}],
                 "prompt-digest",
-                {"type": "pretrained", "model_id": "test-model"},
+                {"type": "lora_adapter", "base_model": "test-model"},
             )
 
         self.assertEqual(config["generation"]["cfg_coef"], 5.0)
+        self.assertEqual(config["adapter_scale"], 0.25)
         self.assertEqual(generate.DEFAULT_GENERATION_PARAMS["cfg_coef"], 3.0)
+
+    def test_rejects_adapter_scale_for_non_adapter_model(self) -> None:
+        args = SimpleNamespace(
+            run_name="test-run",
+            seeds=[42],
+            batch_size=1,
+            cfg_coef=3.0,
+            adapter_scale=0.5,
+        )
+
+        with self.assertRaisesRegex(
+            RuntimeError, "--adapter-scale only applies to LoRA adapter models"
+        ):
+            generate.build_locked_config(
+                args,
+                [{"id": "prompt-0"}],
+                "prompt-digest",
+                {"type": "pretrained", "model_id": "test-model"},
+            )
 
     def test_resolves_adapter_package(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -213,6 +252,28 @@ class EvalGenerateTest(unittest.TestCase):
         self.assertEqual(calls[2][0], "load")
         self.assertEqual(calls[3], "eval")
 
+    def test_applies_runtime_scale_to_every_lora_projection(self) -> None:
+        class FakeProjection:
+            def __init__(self, scaling: float) -> None:
+                self.scaling = scaling
+
+        projections = [FakeProjection(1.0), FakeProjection(0.5)]
+        model = SimpleNamespace(modules=lambda: [model, *projections])
+        lora_module = ModuleType("audiocraft.modules.lora")
+        lora_module.GatedLoRAProjection = FakeProjection
+
+        with mock.patch.dict(
+            sys.modules,
+            {"audiocraft.modules.lora": lora_module},
+        ):
+            count = generate.apply_adapter_scale(model, 0.25)
+
+        self.assertEqual(count, 2)
+        self.assertEqual(
+            [projection.scaling for projection in projections],
+            [0.25, 0.125],
+        )
+
     def test_generates_prompts_in_batches(self) -> None:
         prompts = [
             {"id": f"prompt-{index}", "cohort": "test", "prompt": f"Prompt {index}"}
@@ -226,6 +287,7 @@ class EvalGenerateTest(unittest.TestCase):
         )
         locked_config = {
             "model_source": {"type": "pretrained", "model_id": "test-model"},
+            "adapter_scale": 1.0,
             "generation": generate.generation_params(4.0),
         }
         fake_model = FakeModel()

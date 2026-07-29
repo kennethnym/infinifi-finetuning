@@ -164,6 +164,23 @@ generator verifies both files and their digest, loads the recorded
 manifest, and loads only the adapter tensors. Null-conditioned CFG rows bypass
 the adapter.
 
+Use `--adapter-scale` to multiply every LoRA projection at inference without
+modifying the exported adapter or its recorded alpha. The value is locked in
+the run configuration and defaults to `1.0`. For example, this keeps CFG at
+three while applying one third of the adapter's nominal projection scale:
+
+```bash
+python eval/generate.py \
+  --model /checkpoints/infinifi-lora-r8 \
+  --run-name lora_r8_cfg3_scale033 \
+  --cfg-coef 3 \
+  --adapter-scale 0.3333333333
+```
+
+Scale `0` disables the LoRA deltas and is useful as a base-model equivalence
+check. Non-default adapter scales are rejected for pretrained IDs and full
+fine-tuned model packages.
+
 Use distinct run names for rank, epoch, and CFG comparisons, for example
 `lora_r8_epoch1_cfg3` and `lora_r16_epoch1_cfg4`.
 

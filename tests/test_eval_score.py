@@ -65,6 +65,7 @@ class EvalScoreTest(unittest.TestCase):
                         "type": "pretrained",
                         "model_id": "facebook/musicgen-small",
                     },
+                    "adapter_scale": 1.0,
                     "audiocraft_commit": score.AUDIOCRAFT_COMMIT,
                     "prompt_manifest_sha256": score.sha256_file(score.PROMPTS_PATH),
                     "prompt_ids": ["dataset-1"],
@@ -181,7 +182,29 @@ class EvalScoreTest(unittest.TestCase):
 
         self.assertEqual(loaded_dir, run_dir.resolve())
         self.assertEqual(config["seeds"], [42])
+        self.assertEqual(config["adapter_scale"], 1.0)
         self.assertEqual(records[0]["source_id"], "source-1")
+
+    def test_accepts_legacy_run_without_adapter_scale(self) -> None:
+        run_dir = self.make_run()
+        config_path = run_dir / "config.json"
+        config = json.loads(config_path.read_text(encoding="utf-8"))
+        config.pop("adapter_scale")
+        config_path.write_text(json.dumps(config), encoding="utf-8")
+
+        _, loaded_config, _ = score.load_run("test-run")
+
+        self.assertNotIn("adapter_scale", loaded_config)
+
+    def test_rejects_non_default_adapter_scale_for_pretrained_model(self) -> None:
+        run_dir = self.make_run()
+        config_path = run_dir / "config.json"
+        config = json.loads(config_path.read_text(encoding="utf-8"))
+        config["adapter_scale"] = 0.5
+        config_path.write_text(json.dumps(config), encoding="utf-8")
+
+        with self.assertRaisesRegex(RuntimeError, "non-default adapter_scale"):
+            score.load_run("test-run")
 
     def test_rejects_incomplete_generated_run(self) -> None:
         run_dir = self.make_run()
