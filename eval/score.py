@@ -313,17 +313,31 @@ def load_run(
         raise RuntimeError("Run config contains an invalid model_source")
     if schema_version == 3 and model_source.get("backend") != backend:
         raise RuntimeError("Run config model_source does not match its backend")
-    if backend == "ace-step" and (
-        model_source.get("type") != "pretrained"
-        or not isinstance(model_source.get("model_id"), str)
-        or not model_source["model_id"]
-        or not isinstance(model_source.get("revision"), str)
-        or re.fullmatch(r"[0-9a-f]{40}", model_source["revision"]) is None
-        or model_source.get("library") != "diffusers"
-        or not isinstance(model_source.get("library_version"), str)
-        or not model_source["library_version"]
-    ):
-        raise RuntimeError("Run config contains invalid ACE-Step model provenance")
+    if backend == "ace-step":
+        ace_library = model_source.get("library")
+        invalid_ace_source = (
+            model_source.get("type") != "pretrained"
+            or not isinstance(model_source.get("model_id"), str)
+            or not model_source["model_id"]
+            or not isinstance(model_source.get("revision"), str)
+            or re.fullmatch(r"[0-9a-f]{40}", model_source["revision"]) is None
+            or ace_library not in ("diffusers", "ace-step")
+            or not isinstance(model_source.get("library_version"), str)
+            or not model_source["library_version"]
+        )
+        if ace_library == "ace-step":
+            invalid_ace_source = invalid_ace_source or (
+                not isinstance(model_source.get("model_config"), str)
+                or not model_source["model_config"]
+                or model_source.get("parameter_scale") != "2B"
+                or not isinstance(model_source.get("source_revision"), str)
+                or re.fullmatch(r"[0-9a-f]{40}", model_source["source_revision"])
+                is None
+            )
+        if invalid_ace_source:
+            raise RuntimeError(
+                "Run config contains invalid ACE-Step model provenance"
+            )
     if (
         isinstance(adapter_scale, bool)
         or not isinstance(adapter_scale, (int, float))

@@ -201,10 +201,13 @@ class EvalScoreTest(unittest.TestCase):
         model_source = {
             "type": "pretrained",
             "backend": "ace-step",
-            "model_id": "ACE-Step/acestep-v15-xl-turbo-diffusers",
+            "model_id": "ACE-Step/Ace-Step1.5",
             "revision": "a" * 40,
-            "library": "diffusers",
-            "library_version": "0.39.0",
+            "model_config": "acestep-v15-turbo",
+            "parameter_scale": "2B",
+            "library": "ace-step",
+            "library_version": "1.5.0",
+            "source_revision": "b" * 40,
         }
         config_path = run_dir / "config.json"
         config = json.loads(config_path.read_text(encoding="utf-8"))
@@ -227,6 +230,36 @@ class EvalScoreTest(unittest.TestCase):
         self.assertEqual(loaded_config["backend"], "ace-step")
         self.assertEqual(records[0]["backend"], "ace-step")
         self.assertNotIn("audiocraft_commit", records[0])
+
+    def test_accepts_legacy_diffusers_ace_step_provenance(self) -> None:
+        run_dir = self.make_run()
+        model_source = {
+            "type": "pretrained",
+            "backend": "ace-step",
+            "model_id": "ACE-Step/acestep-v15-xl-turbo-diffusers",
+            "revision": "a" * 40,
+            "library": "diffusers",
+            "library_version": "0.39.0",
+        }
+        config_path = run_dir / "config.json"
+        config = json.loads(config_path.read_text(encoding="utf-8"))
+        config["schema_version"] = 3
+        config["backend"] = "ace-step"
+        config["model_source"] = model_source
+        config.pop("audiocraft_commit")
+        config_path.write_text(json.dumps(config), encoding="utf-8")
+
+        manifest_path = run_dir / "manifest.jsonl"
+        record = json.loads(manifest_path.read_text(encoding="utf-8"))
+        record["backend"] = "ace-step"
+        record["model_source"] = model_source
+        record.pop("audiocraft_commit")
+        record["sample_rate"] = 48_000
+        manifest_path.write_text(json.dumps(record) + "\n", encoding="utf-8")
+
+        _, loaded_config, _ = score.load_run("test-run")
+
+        self.assertEqual(loaded_config["model_source"]["library"], "diffusers")
 
     def test_loads_schema_three_musicgen_run(self) -> None:
         run_dir = self.make_run()
