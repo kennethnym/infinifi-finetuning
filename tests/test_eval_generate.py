@@ -52,13 +52,16 @@ class EvalGenerateTest(unittest.TestCase):
         self.assertEqual(record["revision"], generate.ACE_STEP_DEFAULT_REVISION)
         self.assertEqual(
             record["library_version"],
-            generate.ACE_STEP_DIFFUSERS_VERSION,
+            generate.ACE_STEP_PACKAGE_VERSION,
         )
+        self.assertEqual(record["model_config"], "acestep-v15-turbo")
+        self.assertEqual(record["parameter_scale"], "2B")
+        self.assertEqual(record["source_revision"], generate.ACE_STEP_SOURCE_REVISION)
 
-    def test_requires_revision_for_other_ace_step_model(self) -> None:
-        with self.assertRaisesRegex(RuntimeError, "--model-revision is required"):
+    def test_rejects_other_ace_step_model(self) -> None:
+        with self.assertRaisesRegex(RuntimeError, "supports only the 2B Turbo"):
             generate.resolve_model_source(
-                "ACE-Step/a-different-diffusers-model",
+                "ACE-Step/a-different-model",
                 "ace-step",
             )
 
@@ -73,8 +76,8 @@ class EvalGenerateTest(unittest.TestCase):
             ace_steps=12,
             ace_guidance_scale=1.0,
             ace_shift=2.0,
-            ace_dtype="bfloat16",
             ace_cpu_offload=False,
+            ace_quantization="int8_weight_only",
         )
         model_source = {
             "type": "pretrained",
@@ -94,10 +97,14 @@ class EvalGenerateTest(unittest.TestCase):
         self.assertEqual(config["backend"], "ace-step")
         self.assertNotIn("audiocraft_commit", config)
         self.assertEqual(config["generation"]["lyrics"], "[Instrumental]")
-        self.assertEqual(config["generation"]["num_inference_steps"], 12)
+        self.assertEqual(config["generation"]["inference_steps"], 12)
         self.assertEqual(config["generation"]["shift"], 2.0)
+        self.assertTrue(config["generation"]["instrumental"])
+        self.assertFalse(config["generation"]["thinking"])
+        self.assertFalse(config["generation"]["enable_normalization"])
         self.assertEqual(config["audio_write"]["subtype"], "PCM_16")
         self.assertFalse(config["ace_cpu_offload"])
+        self.assertEqual(config["ace_quantization"], "int8_weight_only")
 
     def test_builds_seed_homogeneous_batches(self) -> None:
         prompts = [
@@ -136,6 +143,24 @@ class EvalGenerateTest(unittest.TestCase):
         with self.assertRaisesRegex(
             RuntimeError, "--batch-size must be greater than zero"
         ):
+            generate.validate_args(args, prompt_count=1)
+
+    def test_requires_single_clip_batches_for_ace_step(self) -> None:
+        args = SimpleNamespace(
+            backend="ace-step",
+            run_name="test-run",
+            limit=None,
+            seeds=[42],
+            model=generate.ACE_STEP_DEFAULT_MODEL,
+            batch_size=2,
+            cfg_coef=3.0,
+            adapter_scale=1.0,
+            ace_steps=8,
+            ace_guidance_scale=1.0,
+            ace_shift=3.0,
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "requires --batch-size 1"):
             generate.validate_args(args, prompt_count=1)
 
     def test_rejects_invalid_cfg_coefficient(self) -> None:
@@ -456,7 +481,7 @@ class EvalGenerateTest(unittest.TestCase):
         self.assertEqual(seeded, [42])
         self.assertEqual(len(resumed_records), 6)
 
-    def test_generates_ace_step_prompts_in_locked_batches(self) -> None:
+    def test_generates_ace_step_2b_prompts_with_native_api(self) -> None:
         prompts = [
             {"id": f"prompt-{index}", "cohort": "test", "prompt": f"Prompt {index}"}
             for index in range(2)
@@ -465,30 +490,35 @@ class EvalGenerateTest(unittest.TestCase):
         args = SimpleNamespace(
             device="cpu",
             model=generate.ACE_STEP_DEFAULT_MODEL,
-            batch_size=2,
+            batch_size=1,
+            ace_checkpoints_dir=None,
         )
         model_source = {
             "type": "pretrained",
             "backend": "ace-step",
             "model_id": generate.ACE_STEP_DEFAULT_MODEL,
             "revision": generate.ACE_STEP_DEFAULT_REVISION,
-            "library": "diffusers",
-            "library_version": generate.ACE_STEP_DIFFUSERS_VERSION,
+            "model_config": generate.ACE_STEP_MODEL_CONFIG,
+            "parameter_scale": "2B",
+            "library": "ace-step",
+            "library_version": generate.ACE_STEP_PACKAGE_VERSION,
+            "source_revision": generate.ACE_STEP_SOURCE_REVISION,
         }
         locked_config = {
             "backend": "ace-step",
             "model_source": model_source,
             "adapter_scale": 1.0,
-            "ace_dtype": "auto",
             "ace_cpu_offload": False,
+            "ace_quantization": None,
             "generation": {
                 **generate.ACE_STEP_DEFAULT_PARAMS,
-                "num_inference_steps": 8,
+                "inference_steps": 8,
             },
             "audio_write": {"format": "wav", "subtype": "PCM_16"},
         }
-        pipeline_calls = []
-        load_calls = []
+        generation_calls = []
+        initialization_calls = []
+        snapshot_calls = []
         written = []
         normalized = []
 
@@ -511,49 +541,58 @@ class EvalGenerateTest(unittest.TestCase):
             def numpy(self) -> list[float]:
                 return [0.0]
 
-        class FakeGenerator:
-            def __init__(self, *, device: str) -> None:
-                self.device = device
-                self.seed = None
-
-            def manual_seed(self, seed: int) -> "FakeGenerator":
-                self.seed = seed
-                return self
-
-        class FakePipeline:
+        class FakeAceStepHandler:
             sample_rate = 48_000
+            dtype = "torch.float32"
+            quantization = None
 
-            def __init__(self) -> None:
-                self.vae = SimpleNamespace(enable_tiling=lambda: None)
+            def initialize_service(self, **kwargs: object) -> tuple[str, bool]:
+                initialization_calls.append(kwargs)
+                self.quantization = kwargs["quantization"]
+                return "initialized", True
 
-            @classmethod
-            def from_pretrained(cls, source: str, **kwargs: object) -> "FakePipeline":
-                load_calls.append((source, kwargs))
-                return cls()
+        class FakeGenerationParams:
+            def __init__(self, **kwargs: object) -> None:
+                self.values = kwargs
 
-            def to(self, device: str) -> "FakePipeline":
-                self.device = device
-                return self
+        class FakeGenerationConfig:
+            def __init__(self, **kwargs: object) -> None:
+                self.values = kwargs
 
-            def __call__(self, **kwargs: object) -> object:
-                pipeline_calls.append(kwargs)
-                return SimpleNamespace(
-                    audios=[
-                        FakeAceWaveform()
-                        for _ in kwargs["prompt"]  # type: ignore[arg-type]
-                    ]
-                )
+        def fake_generate_music(
+            handler: object,
+            llm_handler: object,
+            params: FakeGenerationParams,
+            config: FakeGenerationConfig,
+            *,
+            save_dir: object,
+        ) -> object:
+            generation_calls.append(
+                (handler, llm_handler, params.values, config.values, save_dir)
+            )
+            return SimpleNamespace(
+                success=True,
+                error=None,
+                status_message="ok",
+                audios=[
+                    {
+                        "tensor": FakeAceWaveform(),
+                        "sample_rate": 48_000,
+                    }
+                ],
+            )
 
+        def fake_snapshot_download(**kwargs: object) -> str:
+            snapshot_calls.append(kwargs)
+            return str(kwargs["local_dir"])
+
+        seeded = []
         torch_module = ModuleType("torch")
         torch_module.__version__ = "test"
         torch_module.version = SimpleNamespace(cuda=None)
         torch_module.cuda = SimpleNamespace(is_available=lambda: False)
-        torch_module.manual_seed = lambda _seed: None
+        torch_module.manual_seed = seeded.append
         torch_module.inference_mode = nullcontext
-        torch_module.Generator = FakeGenerator
-        torch_module.float32 = "torch.float32"
-        torch_module.float16 = "torch.float16"
-        torch_module.bfloat16 = "torch.bfloat16"
 
         soundfile_module = ModuleType("soundfile")
 
@@ -564,17 +603,29 @@ class EvalGenerateTest(unittest.TestCase):
         soundfile_module.write = soundfile_write
         torchaudio_module = ModuleType("torchaudio")
         torchaudio_module.__version__ = "test"
-        diffusers_module = ModuleType("diffusers")
-        diffusers_module.AceStepPipeline = FakePipeline
+        acestep_module = ModuleType("acestep")
+        acestep_handler_module = ModuleType("acestep.handler")
+        acestep_handler_module.AceStepHandler = FakeAceStepHandler
+        acestep_inference_module = ModuleType("acestep.inference")
+        acestep_inference_module.GenerationConfig = FakeGenerationConfig
+        acestep_inference_module.GenerationParams = FakeGenerationParams
+        acestep_inference_module.generate_music = fake_generate_music
+        huggingface_hub_module = ModuleType("huggingface_hub")
+        huggingface_hub_module.snapshot_download = fake_snapshot_download
         modules = {
             "torch": torch_module,
             "soundfile": soundfile_module,
             "torchaudio": torchaudio_module,
-            "diffusers": diffusers_module,
+            "acestep": acestep_module,
+            "acestep.handler": acestep_handler_module,
+            "acestep.inference": acestep_inference_module,
+            "huggingface_hub": huggingface_hub_module,
         }
         versions = {
-            "diffusers": generate.ACE_STEP_DIFFUSERS_VERSION,
+            "ace-step": generate.ACE_STEP_PACKAGE_VERSION,
+            "diffusers": "test",
             "transformers": "test",
+            "huggingface-hub": "test",
             "soundfile": "test",
         }
 
@@ -589,12 +640,23 @@ class EvalGenerateTest(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as temporary_directory:
             output_dir = Path(temporary_directory) / "run"
+            checkpoints_dir = Path(temporary_directory) / "checkpoints"
+            args.ace_checkpoints_dir = str(checkpoints_dir)
             with (
                 mock.patch.dict(sys.modules, modules),
+                mock.patch.dict("os.environ", {}, clear=False),
                 mock.patch.object(
                     generate,
                     "package_version",
                     side_effect=lambda name: versions.get(name),
+                ),
+                mock.patch.object(
+                    generate,
+                    "verify_ace_step_source_checkout",
+                    return_value=(
+                        Path("/ace-step-source"),
+                        generate.ACE_STEP_SOURCE_REVISION,
+                    ),
                 ),
                 mock.patch.object(
                     generate,
@@ -619,17 +681,29 @@ class EvalGenerateTest(unittest.TestCase):
             ]
 
         self.assertEqual(
-            load_calls[0][1]["revision"],
+            snapshot_calls[0]["revision"],
             generate.ACE_STEP_DEFAULT_REVISION,
         )
-        self.assertEqual(load_calls[0][1]["torch_dtype"], "torch.float32")
-        self.assertEqual(pipeline_calls[0]["prompt"], ["Prompt 0", "Prompt 1"])
+        self.assertEqual(snapshot_calls[0]["repo_id"], generate.ACE_STEP_DEFAULT_MODEL)
         self.assertEqual(
-            pipeline_calls[0]["lyrics"],
-            ["[Instrumental]", "[Instrumental]"],
+            initialization_calls[0]["config_path"],
+            generate.ACE_STEP_MODEL_CONFIG,
         )
-        self.assertEqual(pipeline_calls[0]["audio_duration"], 30)
-        self.assertEqual(pipeline_calls[0]["generator"].seed, 42)
+        self.assertFalse(initialization_calls[0]["offload_to_cpu"])
+        self.assertIsNone(initialization_calls[0]["quantization"])
+        self.assertEqual(
+            [call[2]["caption"] for call in generation_calls],
+            ["Prompt 0", "Prompt 1"],
+        )
+        self.assertEqual(generation_calls[0][2]["lyrics"], "[Instrumental]")
+        self.assertTrue(generation_calls[0][2]["instrumental"])
+        self.assertEqual(generation_calls[0][2]["duration"], 30)
+        self.assertEqual(generation_calls[0][2]["inference_steps"], 8)
+        self.assertFalse(generation_calls[0][2]["thinking"])
+        self.assertFalse(generation_calls[0][2]["enable_normalization"])
+        self.assertEqual(generation_calls[0][3]["seeds"], [42])
+        self.assertFalse(generation_calls[0][3]["use_random_seed"])
+        self.assertEqual(seeded, [42, 42])
         self.assertEqual(len(written), 2)
         self.assertEqual(normalized, [48_000, 48_000])
         self.assertEqual(records[0]["backend"], "ace-step")

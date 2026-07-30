@@ -9,6 +9,8 @@ from pathlib import Path
 import platform
 import random
 import re
+import subprocess
+import sys
 from typing import Any
 
 
@@ -22,17 +24,23 @@ AUDIOCRAFT_COMMIT = "adf0b04a4452f171970028fcf80f101dd5e26e19"
 AUDIOCRAFT_PATCH = PROJECT_ROOT / "patches" / "audiocraft-lora.patch"
 BACKENDS = ("musicgen", "ace-step")
 DEFAULT_BACKEND = "musicgen"
-ACE_STEP_DEFAULT_MODEL = "ACE-Step/acestep-v15-xl-turbo-diffusers"
-ACE_STEP_DEFAULT_REVISION = "200ba991ae448051e14b0183157e35c2d27c9fb0"
-ACE_STEP_DIFFUSERS_VERSION = "0.39.0"
+ACE_STEP_DEFAULT_MODEL = "ACE-Step/Ace-Step1.5"
+ACE_STEP_DEFAULT_REVISION = "19671f406d603126926c1b7e2adc169acbcade22"
+ACE_STEP_MODEL_CONFIG = "acestep-v15-turbo"
+ACE_STEP_PACKAGE_VERSION = "1.5.0"
+ACE_STEP_SOURCE_REVISION = "dce621408bee8c31b4fcf4811682eb9359e1bc94"
 ACE_STEP_LYRICS = "[Instrumental]"
 ACE_STEP_DEFAULT_PARAMS = {
     "duration": 30,
     "task_type": "text2music",
     "lyrics": ACE_STEP_LYRICS,
-    "num_inference_steps": 8,
+    "instrumental": True,
+    "inference_steps": 8,
     "guidance_scale": 1.0,
     "shift": 3.0,
+    "thinking": False,
+    "enable_normalization": False,
+    "dcw_enabled": True,
 }
 DEFAULT_GENERATION_PARAMS = {
     "duration": 30,
@@ -83,7 +91,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--model-revision",
         help=(
-            "Exact Hugging Face revision for ACE-Step. The documented XL Turbo "
+            "Exact Hugging Face revision for ACE-Step. The supported 2B Turbo "
             "model defaults to the revision pinned by this repository."
         ),
     )
@@ -128,15 +136,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--ace-steps",
         type=int,
-        default=ACE_STEP_DEFAULT_PARAMS["num_inference_steps"],
-        help="ACE-Step denoising steps (default: 8 for XL Turbo).",
+        default=ACE_STEP_DEFAULT_PARAMS["inference_steps"],
+        help="ACE-Step denoising steps (default: 8 for 2B Turbo).",
     )
     parser.add_argument(
         "--ace-guidance-scale",
         type=float,
         default=ACE_STEP_DEFAULT_PARAMS["guidance_scale"],
         help=(
-            "ACE-Step guidance scale (default: 1.0; XL Turbo has distilled "
+            "ACE-Step guidance scale (default: 1.0; 2B Turbo has distilled "
             "guidance and ignores values above 1.0)."
         ),
     )
@@ -144,18 +152,24 @@ def parse_args() -> argparse.Namespace:
         "--ace-shift",
         type=float,
         default=ACE_STEP_DEFAULT_PARAMS["shift"],
-        help="ACE-Step timestep shift (default: 3.0 for XL Turbo).",
-    )
-    parser.add_argument(
-        "--ace-dtype",
-        choices=("auto", "float32", "float16", "bfloat16"),
-        default="auto",
-        help="ACE-Step model dtype (default: bfloat16 on CUDA, float32 on CPU).",
+        help="ACE-Step timestep shift (default: 3.0 for 2B Turbo).",
     )
     parser.add_argument(
         "--ace-cpu-offload",
         action="store_true",
-        help="Offload ACE-Step pipeline components to CPU to reduce CUDA memory use.",
+        help="Enable full ACE-Step CPU offload to reduce CUDA memory use.",
+    )
+    parser.add_argument(
+        "--ace-quantization",
+        choices=("int8_weight_only", "fp8_weight_only", "w8a8_dynamic"),
+        help="Optional ACE-Step DiT quantization mode.",
+    )
+    parser.add_argument(
+        "--ace-checkpoints-dir",
+        help=(
+            "Directory for the pinned ACE-Step model snapshot. Defaults to "
+            "$ACESTEP_CHECKPOINTS_DIR or ~/.cache/ace-step/checkpoints."
+        ),
     )
     parser.add_argument(
         "--limit",
@@ -276,7 +290,12 @@ def validate_args(args: argparse.Namespace, prompt_count: int) -> Path:
     if not math.isfinite(args.adapter_scale) or args.adapter_scale < 0:
         raise RuntimeError("--adapter-scale must be a finite non-negative number")
     if backend == "ace-step":
-        if getattr(args, "ace_steps", ACE_STEP_DEFAULT_PARAMS["num_inference_steps"]) <= 0:
+        if args.batch_size != 1:
+            raise RuntimeError(
+                "ACE-Step 2B generation requires --batch-size 1 because its native "
+                "API accepts one caption per inference call"
+            )
+        if getattr(args, "ace_steps", ACE_STEP_DEFAULT_PARAMS["inference_steps"]) <= 0:
             raise RuntimeError("--ace-steps must be greater than zero")
         ace_guidance_scale = getattr(
             args,
@@ -299,6 +318,12 @@ def validate_args(args: argparse.Namespace, prompt_count: int) -> Path:
             raise RuntimeError("--model-revision only applies to the ACE-Step backend")
         if getattr(args, "ace_cpu_offload", False):
             raise RuntimeError("--ace-cpu-offload only applies to the ACE-Step backend")
+        if getattr(args, "ace_quantization", None) is not None:
+            raise RuntimeError("--ace-quantization only applies to the ACE-Step backend")
+        if getattr(args, "ace_checkpoints_dir", None) is not None:
+            raise RuntimeError(
+                "--ace-checkpoints-dir only applies to the ACE-Step backend"
+            )
 
     runs_root = RUNS_ROOT.resolve()
     output_dir = (RUNS_ROOT / args.run_name).resolve()
@@ -317,10 +342,10 @@ def generation_params(cfg_coef: float) -> dict[str, Any]:
 def ace_step_generation_params(args: argparse.Namespace) -> dict[str, Any]:
     return {
         **ACE_STEP_DEFAULT_PARAMS,
-        "num_inference_steps": getattr(
+        "inference_steps": getattr(
             args,
             "ace_steps",
-            ACE_STEP_DEFAULT_PARAMS["num_inference_steps"],
+            ACE_STEP_DEFAULT_PARAMS["inference_steps"],
         ),
         "guidance_scale": getattr(
             args,
@@ -452,17 +477,17 @@ def resolve_model_source(
             ("./", "../", "~")
         ):
             raise RuntimeError(
-                "ACE-Step currently requires a Hugging Face Diffusers model ID, "
+                "ACE-Step currently requires the supported Hugging Face model ID, "
                 "not a local model directory."
             )
-        revision = model_revision
-        if revision is None and supplied_source == ACE_STEP_DEFAULT_MODEL:
-            revision = ACE_STEP_DEFAULT_REVISION
-        if revision is None:
+        if supplied_source != ACE_STEP_DEFAULT_MODEL:
             raise RuntimeError(
-                "--model-revision is required for ACE-Step models other than "
+                "The ACE-Step backend currently supports only the 2B Turbo model "
                 f"{ACE_STEP_DEFAULT_MODEL}."
             )
+        revision = model_revision
+        if revision is None:
+            revision = ACE_STEP_DEFAULT_REVISION
         if not re.fullmatch(r"[0-9a-fA-F]{40}", revision):
             raise RuntimeError(
                 "--model-revision must be a full 40-character Hugging Face commit."
@@ -473,8 +498,11 @@ def resolve_model_source(
             "supplied": supplied_source,
             "model_id": supplied_source,
             "revision": revision.lower(),
-            "library": "diffusers",
-            "library_version": ACE_STEP_DIFFUSERS_VERSION,
+            "model_config": ACE_STEP_MODEL_CONFIG,
+            "parameter_scale": "2B",
+            "library": "ace-step",
+            "library_version": ACE_STEP_PACKAGE_VERSION,
+            "source_revision": ACE_STEP_SOURCE_REVISION,
         }
     if backend != "musicgen":
         raise RuntimeError(f"Unsupported generation backend: {backend!r}")
@@ -635,8 +663,8 @@ def build_locked_config(
     if backend == "musicgen":
         config["audiocraft_commit"] = AUDIOCRAFT_COMMIT
     else:
-        config["ace_dtype"] = getattr(args, "ace_dtype", "auto")
         config["ace_cpu_offload"] = getattr(args, "ace_cpu_offload", False)
+        config["ace_quantization"] = getattr(args, "ace_quantization", None)
     return config
 
 
@@ -943,18 +971,6 @@ def generate_musicgen(
     print(f"run complete: {len(clip_plan)} clips in {output_dir}")
 
 
-def resolve_ace_step_dtype(torch: Any, requested: str, device: str) -> Any:
-    dtype_name = requested
-    if dtype_name == "auto":
-        dtype_name = "bfloat16" if device.startswith("cuda") else "float32"
-    if not device.startswith("cuda") and dtype_name == "float16":
-        raise RuntimeError(
-            "ACE-Step float16 inference requires CUDA; use --ace-dtype float32 "
-            "or bfloat16 on CPU."
-        )
-    return getattr(torch, dtype_name)
-
-
 def normalize_ace_step_audio(
     torch: Any,
     torchaudio: Any,
@@ -974,35 +990,119 @@ def normalize_ace_step_audio(
     return waveform
 
 
-def load_ace_step_pipeline(
-    AceStepPipeline: Any,
-    torch: Any,
+def resolve_ace_step_checkpoints_dir(supplied: str | None) -> Path:
+    configured = supplied or os.environ.get("ACESTEP_CHECKPOINTS_DIR")
+    if configured:
+        directory = Path(configured).expanduser().resolve()
+    else:
+        directory = Path.home() / ".cache" / "ace-step" / "checkpoints"
+    if directory.exists() and not directory.is_dir():
+        raise RuntimeError(
+            f"ACE-Step checkpoints path is not a directory: {directory}"
+        )
+    return directory
+
+
+def verify_ace_step_source_checkout(AceStepHandler: Any) -> tuple[Path, str]:
+    installed_version = package_version("ace-step")
+    if installed_version != ACE_STEP_PACKAGE_VERSION:
+        raise RuntimeError(
+            f"ACE-Step generation requires ace-step=={ACE_STEP_PACKAGE_VERSION}; "
+            f"found {installed_version!r}."
+        )
+
+    module = sys.modules.get(AceStepHandler.__module__)
+    module_file = getattr(module, "__file__", None)
+    if module_file is None:
+        raise RuntimeError("Cannot locate the installed ACE-Step source checkout")
+    source_path = Path(module_file).resolve()
+    source_root = next(
+        (parent for parent in source_path.parents if (parent / ".git").exists()),
+        None,
+    )
+    if source_root is None:
+        raise RuntimeError(
+            "ACE-Step must be installed from the pinned source checkout documented "
+            "in eval/README.md."
+        )
+
+    revision_result = subprocess.run(
+        ["git", "-C", str(source_root), "rev-parse", "HEAD"],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    revision = revision_result.stdout.strip().lower()
+    if revision_result.returncode != 0 or revision != ACE_STEP_SOURCE_REVISION:
+        raise RuntimeError(
+            "ACE-Step source checkout is not at the pinned revision "
+            f"{ACE_STEP_SOURCE_REVISION}: found {revision or 'unknown'}."
+        )
+    dirty_result = subprocess.run(
+        [
+            "git",
+            "-C",
+            str(source_root),
+            "status",
+            "--porcelain",
+            "--untracked-files=all",
+            "--",
+            "acestep",
+            "pyproject.toml",
+            "uv.lock",
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if dirty_result.returncode != 0 or dirty_result.stdout.strip():
+        raise RuntimeError(
+            "ACE-Step source files differ from the pinned checkout; restore them "
+            "or use a clean checkout."
+        )
+    return source_root, revision
+
+
+def load_ace_step_model(
+    AceStepHandler: Any,
+    snapshot_download: Any,
     model_source: str,
     model_source_record: dict[str, Any],
     device: str,
-    requested_dtype: str,
     cpu_offload: bool,
-) -> tuple[Any, Any]:
-    installed_diffusers = package_version("diffusers")
-    if installed_diffusers != ACE_STEP_DIFFUSERS_VERSION:
-        raise RuntimeError(
-            f"ACE-Step generation requires diffusers=={ACE_STEP_DIFFUSERS_VERSION}; "
-            f"found {installed_diffusers!r}."
-        )
-    dtype = resolve_ace_step_dtype(torch, requested_dtype, device)
-    pipeline = AceStepPipeline.from_pretrained(
-        model_source,
+    quantization: str | None,
+    checkpoints_dir: Path,
+) -> tuple[Any, Path, str]:
+    source_root, source_revision = verify_ace_step_source_checkout(AceStepHandler)
+    if cpu_offload and not device.startswith("cuda"):
+        raise RuntimeError("--ace-cpu-offload requires a CUDA device")
+
+    checkpoints_dir.mkdir(parents=True, exist_ok=True)
+    snapshot_download(
+        repo_id=model_source,
         revision=model_source_record["revision"],
-        torch_dtype=dtype,
+        local_dir=str(checkpoints_dir),
     )
-    if cpu_offload:
-        if not device.startswith("cuda"):
-            raise RuntimeError("--ace-cpu-offload requires a CUDA device")
-        pipeline.enable_model_cpu_offload(device=device)
-    else:
-        pipeline = pipeline.to(device)
-    pipeline.vae.enable_tiling()
-    return pipeline, dtype
+    os.environ["ACESTEP_CHECKPOINTS_DIR"] = str(checkpoints_dir)
+
+    handler = AceStepHandler()
+    status_message, success = handler.initialize_service(
+        project_root=str(checkpoints_dir.parent),
+        config_path=model_source_record["model_config"],
+        device=device,
+        offload_to_cpu=cpu_offload,
+        offload_dit_to_cpu=cpu_offload,
+        quantization=quantization,
+        prefer_source="huggingface",
+    )
+    if not success:
+        raise RuntimeError(f"ACE-Step model initialization failed: {status_message}")
+    if handler.quantization != quantization:
+        raise RuntimeError(
+            "ACE-Step did not enable the requested quantization mode: "
+            f"requested {quantization!r}, active {handler.quantization!r}"
+        )
+    return handler, source_root, source_revision
 
 
 def generate_ace_step(
@@ -1016,11 +1116,17 @@ def generate_ace_step(
         import soundfile
         import torch
         import torchaudio
-        from diffusers import AceStepPipeline
+        from acestep.handler import AceStepHandler
+        from acestep.inference import (
+            GenerationConfig,
+            GenerationParams,
+            generate_music as ace_generate_music,
+        )
+        from huggingface_hub import snapshot_download
     except ImportError as error:
         raise RuntimeError(
-            "ACE-Step generation requires a separate Python environment "
-            "installed from ace-step-requirements.txt."
+            "ACE-Step 2B generation requires the pinned official source environment "
+            "documented in eval/README.md."
         ) from error
 
     device = args.device
@@ -1048,16 +1154,20 @@ def generate_ace_step(
     ]
 
     print(f"loading {args.model} on {device}...")
-    pipeline, dtype = load_ace_step_pipeline(
-        AceStepPipeline,
-        torch,
+    checkpoints_dir = resolve_ace_step_checkpoints_dir(
+        getattr(args, "ace_checkpoints_dir", None)
+    )
+    handler, source_root, source_revision = load_ace_step_model(
+        AceStepHandler,
+        snapshot_download,
         model_source,
         locked_config["model_source"],
         device,
-        locked_config["ace_dtype"],
         locked_config["ace_cpu_offload"],
+        locked_config["ace_quantization"],
+        checkpoints_dir,
     )
-    sample_rate = pipeline.sample_rate
+    sample_rate = handler.sample_rate
 
     runtime_path = output_dir / "runtime.json"
     runtime = {
@@ -1067,8 +1177,12 @@ def generate_ace_step(
         "torch": torch.__version__,
         "torchaudio": torchaudio.__version__,
         "cuda": torch.version.cuda,
+        "ace_step": package_version("ace-step"),
+        "ace_step_source_revision": source_revision,
+        "ace_step_source_root": str(source_root),
         "diffusers": package_version("diffusers"),
         "transformers": package_version("transformers"),
+        "huggingface_hub": package_version("huggingface-hub"),
         "soundfile": package_version("soundfile"),
         "device": device,
         "device_name": (
@@ -1076,8 +1190,12 @@ def generate_ace_step(
             if device.startswith("cuda")
             else None
         ),
-        "dtype": str(dtype).removeprefix("torch."),
+        "dtype": str(handler.dtype).removeprefix("torch."),
         "cpu_offload": locked_config["ace_cpu_offload"],
+        "quantization": locked_config["ace_quantization"],
+        "checkpoints_dir": str(checkpoints_dir),
+        "model_revision": locked_config["model_source"]["revision"],
+        "model_config": locked_config["model_source"]["model_config"],
         "sample_rate": sample_rate,
     }
     if runtime_path.exists():
@@ -1116,69 +1234,96 @@ def generate_ace_step(
                 f"{len(pending_batch)} pending of {len(batch)} clips"
             )
             seed_everything(torch, seed, device)
-            generator = torch.Generator(device=device).manual_seed(seed)
+            clip = batch[0]
+            generation_params = GenerationParams(
+                task_type=generation["task_type"],
+                caption=clip["prompt"],
+                lyrics=generation["lyrics"],
+                instrumental=generation["instrumental"],
+                duration=generation["duration"],
+                inference_steps=generation["inference_steps"],
+                guidance_scale=generation["guidance_scale"],
+                shift=generation["shift"],
+                thinking=generation["thinking"],
+                use_cot_metas=False,
+                use_cot_caption=False,
+                use_cot_language=False,
+                enable_normalization=generation["enable_normalization"],
+                dcw_enabled=generation["dcw_enabled"],
+                seed=seed,
+            )
+            generation_config = GenerationConfig(
+                batch_size=1,
+                use_random_seed=False,
+                seeds=[seed],
+                audio_format="wav",
+            )
             with torch.inference_mode():
-                result = pipeline(
-                    prompt=[clip["prompt"] for clip in batch],
-                    lyrics=[generation["lyrics"]] * len(batch),
-                    audio_duration=generation["duration"],
-                    task_type=generation["task_type"],
-                    num_inference_steps=generation["num_inference_steps"],
-                    guidance_scale=generation["guidance_scale"],
-                    shift=generation["shift"],
-                    generator=generator,
-                    output_type="pt",
+                result = ace_generate_music(
+                    handler,
+                    None,
+                    generation_params,
+                    generation_config,
+                    save_dir=None,
                 )
-            waveforms = result.audios
-            if len(waveforms) != len(batch):
+            if not result.success:
+                raise RuntimeError(
+                    f"ACE-Step generation failed for {clip['clip_id']}: "
+                    f"{result.error or result.status_message}"
+                )
+            if len(result.audios) != 1:
                 raise RuntimeError(
                     "ACE-Step returned an unexpected number of waveforms: "
-                    f"expected {len(batch)}, got {len(waveforms)}"
+                    f"expected 1, got {len(result.audios)}"
+                )
+            audio = result.audios[0]
+            waveform = audio.get("tensor")
+            returned_sample_rate = audio.get("sample_rate")
+            if waveform is None or returned_sample_rate != sample_rate:
+                raise RuntimeError(
+                    "ACE-Step returned invalid audio data or an unexpected sample rate"
                 )
 
-            for clip, waveform in zip(batch, waveforms):
-                if clip["clip_id"] in completed:
-                    continue
-                output_path = output_dir / clip["audio_path"]
-                waveform = waveform.detach().cpu().float()
-                if waveform.ndim != 2:
-                    raise RuntimeError(
-                        "ACE-Step returned a waveform with an unexpected shape: "
-                        f"{tuple(waveform.shape)}"
-                    )
-                waveform = normalize_ace_step_audio(
-                    torch,
-                    torchaudio,
-                    waveform,
-                    sample_rate,
+            output_path = output_dir / clip["audio_path"]
+            waveform = waveform.detach().cpu().float()
+            if waveform.ndim != 2:
+                raise RuntimeError(
+                    "ACE-Step returned a waveform with an unexpected shape: "
+                    f"{tuple(waveform.shape)}"
                 )
-                soundfile.write(
-                    str(output_path),
-                    waveform.transpose(0, 1).numpy(),
-                    sample_rate,
-                    format="WAV",
-                    subtype=locked_config["audio_write"]["subtype"],
+            waveform = normalize_ace_step_audio(
+                torch,
+                torchaudio,
+                waveform,
+                sample_rate,
+            )
+            soundfile.write(
+                str(output_path),
+                waveform.transpose(0, 1).numpy(),
+                sample_rate,
+                format="WAV",
+                subtype=locked_config["audio_write"]["subtype"],
+            )
+            if not output_path.is_file():
+                raise RuntimeError(
+                    f"ACE-Step did not create expected file: {output_path}"
                 )
-                if not output_path.is_file():
-                    raise RuntimeError(
-                        f"ACE-Step did not create expected file: {output_path}"
-                    )
 
-                record = {
-                    **clip,
-                    "model_source": locked_config["model_source"],
-                    **clip_backend_metadata(locked_config),
-                    "sample_rate": sample_rate,
-                    "duration_seconds": generation["duration"],
-                }
-                manifest_file.write(json.dumps(record, ensure_ascii=False) + "\n")
-                manifest_file.flush()
-                os.fsync(manifest_file.fileno())
-                generated_count += 1
-                print(
-                    f"[{generated_count}/{len(pending)}] {clip['prompt_id']} "
-                    f"(seed {clip['seed']})"
-                )
+            record = {
+                **clip,
+                "model_source": locked_config["model_source"],
+                **clip_backend_metadata(locked_config),
+                "sample_rate": sample_rate,
+                "duration_seconds": generation["duration"],
+            }
+            manifest_file.write(json.dumps(record, ensure_ascii=False) + "\n")
+            manifest_file.flush()
+            os.fsync(manifest_file.fileno())
+            generated_count += 1
+            print(
+                f"[{generated_count}/{len(pending)}] {clip['prompt_id']} "
+                f"(seed {clip['seed']})"
+            )
 
     print(f"run complete: {len(clip_plan)} clips in {output_dir}")
 
