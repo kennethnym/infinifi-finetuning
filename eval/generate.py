@@ -20,6 +20,20 @@ RUNS_ROOT = PROJECT_ROOT / "runs"
 
 AUDIOCRAFT_COMMIT = "adf0b04a4452f171970028fcf80f101dd5e26e19"
 AUDIOCRAFT_PATCH = PROJECT_ROOT / "patches" / "audiocraft-lora.patch"
+BACKENDS = ("musicgen", "ace-step")
+DEFAULT_BACKEND = "musicgen"
+ACE_STEP_DEFAULT_MODEL = "ACE-Step/acestep-v15-xl-turbo-diffusers"
+ACE_STEP_DEFAULT_REVISION = "200ba991ae448051e14b0183157e35c2d27c9fb0"
+ACE_STEP_DIFFUSERS_VERSION = "0.39.0"
+ACE_STEP_LYRICS = "[Instrumental]"
+ACE_STEP_DEFAULT_PARAMS = {
+    "duration": 30,
+    "task_type": "text2music",
+    "lyrics": ACE_STEP_LYRICS,
+    "num_inference_steps": 8,
+    "guidance_scale": 1.0,
+    "shift": 3.0,
+}
 DEFAULT_GENERATION_PARAMS = {
     "duration": 30,
     "use_sampling": True,
@@ -33,6 +47,10 @@ AUDIO_WRITE_PARAMS = {
     "strategy": "loudness",
     "loudness_compressor": True,
 }
+ACE_STEP_AUDIO_WRITE_PARAMS = {
+    **AUDIO_WRITE_PARAMS,
+    "subtype": "PCM_16",
+}
 SAFE_ID = re.compile(r"^[A-Za-z0-9._-]+$")
 SAFE_RUN_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 LOCAL_MODEL_FILES = ("state_dict.bin", "compression_state_dict.bin")
@@ -45,14 +63,29 @@ DEFAULT_ADAPTER_SCALE = 1.0
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Generate a reproducible evaluation run from a pretrained MusicGen "
-            "model or an exported local model package."
+            "Generate a reproducible evaluation run with MusicGen or ACE-Step 1.5."
         )
+    )
+    parser.add_argument(
+        "--backend",
+        choices=BACKENDS,
+        default=DEFAULT_BACKEND,
+        help="Generation backend (default: musicgen).",
     )
     parser.add_argument(
         "--model",
         required=True,
-        help="Pretrained AudioCraft model ID or exported local model package directory.",
+        help=(
+            "Pretrained model ID. MusicGen also accepts an exported local model "
+            "or LoRA adapter package."
+        ),
+    )
+    parser.add_argument(
+        "--model-revision",
+        help=(
+            "Exact Hugging Face revision for ACE-Step. The documented XL Turbo "
+            "model defaults to the revision pinned by this repository."
+        ),
     )
     parser.add_argument(
         "--run-name",
@@ -81,7 +114,7 @@ def parse_args() -> argparse.Namespace:
         "--cfg-coef",
         type=float,
         default=DEFAULT_GENERATION_PARAMS["cfg_coef"],
-        help="Classifier-free guidance coefficient (default: 3.0).",
+        help="MusicGen classifier-free guidance coefficient (default: 3.0).",
     )
     parser.add_argument(
         "--adapter-scale",
@@ -91,6 +124,38 @@ def parse_args() -> argparse.Namespace:
             "Inference-only multiplier for LoRA projections "
             "(default: 1.0; LoRA adapters only)."
         ),
+    )
+    parser.add_argument(
+        "--ace-steps",
+        type=int,
+        default=ACE_STEP_DEFAULT_PARAMS["num_inference_steps"],
+        help="ACE-Step denoising steps (default: 8 for XL Turbo).",
+    )
+    parser.add_argument(
+        "--ace-guidance-scale",
+        type=float,
+        default=ACE_STEP_DEFAULT_PARAMS["guidance_scale"],
+        help=(
+            "ACE-Step guidance scale (default: 1.0; XL Turbo has distilled "
+            "guidance and ignores values above 1.0)."
+        ),
+    )
+    parser.add_argument(
+        "--ace-shift",
+        type=float,
+        default=ACE_STEP_DEFAULT_PARAMS["shift"],
+        help="ACE-Step timestep shift (default: 3.0 for XL Turbo).",
+    )
+    parser.add_argument(
+        "--ace-dtype",
+        choices=("auto", "float32", "float16", "bfloat16"),
+        default="auto",
+        help="ACE-Step model dtype (default: bfloat16 on CUDA, float32 on CPU).",
+    )
+    parser.add_argument(
+        "--ace-cpu-offload",
+        action="store_true",
+        help="Offload ACE-Step pipeline components to CPU to reduce CUDA memory use.",
     )
     parser.add_argument(
         "--limit",
@@ -186,6 +251,9 @@ def load_prompts() -> list[dict[str, Any]]:
 
 
 def validate_args(args: argparse.Namespace, prompt_count: int) -> Path:
+    backend = getattr(args, "backend", DEFAULT_BACKEND)
+    if backend not in BACKENDS:
+        raise RuntimeError(f"Unsupported generation backend: {backend!r}")
     if not SAFE_RUN_NAME.fullmatch(args.run_name):
         raise RuntimeError(
             "--run-name must start with an ASCII letter or digit, contain only "
@@ -207,6 +275,30 @@ def validate_args(args: argparse.Namespace, prompt_count: int) -> Path:
         raise RuntimeError("--cfg-coef must be a finite positive number")
     if not math.isfinite(args.adapter_scale) or args.adapter_scale < 0:
         raise RuntimeError("--adapter-scale must be a finite non-negative number")
+    if backend == "ace-step":
+        if getattr(args, "ace_steps", ACE_STEP_DEFAULT_PARAMS["num_inference_steps"]) <= 0:
+            raise RuntimeError("--ace-steps must be greater than zero")
+        ace_guidance_scale = getattr(
+            args,
+            "ace_guidance_scale",
+            ACE_STEP_DEFAULT_PARAMS["guidance_scale"],
+        )
+        if not math.isfinite(ace_guidance_scale) or ace_guidance_scale <= 0:
+            raise RuntimeError(
+                "--ace-guidance-scale must be a finite positive number"
+            )
+        ace_shift = getattr(args, "ace_shift", ACE_STEP_DEFAULT_PARAMS["shift"])
+        if not math.isfinite(ace_shift) or ace_shift <= 0:
+            raise RuntimeError("--ace-shift must be a finite positive number")
+        if args.cfg_coef != DEFAULT_GENERATION_PARAMS["cfg_coef"]:
+            raise RuntimeError("--cfg-coef only applies to the MusicGen backend")
+        if args.adapter_scale != DEFAULT_ADAPTER_SCALE:
+            raise RuntimeError("--adapter-scale only applies to MusicGen LoRA adapters")
+    else:
+        if getattr(args, "model_revision", None) is not None:
+            raise RuntimeError("--model-revision only applies to the ACE-Step backend")
+        if getattr(args, "ace_cpu_offload", False):
+            raise RuntimeError("--ace-cpu-offload only applies to the ACE-Step backend")
 
     runs_root = RUNS_ROOT.resolve()
     output_dir = (RUNS_ROOT / args.run_name).resolve()
@@ -219,6 +311,27 @@ def generation_params(cfg_coef: float) -> dict[str, Any]:
     return {
         **DEFAULT_GENERATION_PARAMS,
         "cfg_coef": cfg_coef,
+    }
+
+
+def ace_step_generation_params(args: argparse.Namespace) -> dict[str, Any]:
+    return {
+        **ACE_STEP_DEFAULT_PARAMS,
+        "num_inference_steps": getattr(
+            args,
+            "ace_steps",
+            ACE_STEP_DEFAULT_PARAMS["num_inference_steps"],
+        ),
+        "guidance_scale": getattr(
+            args,
+            "ace_guidance_scale",
+            ACE_STEP_DEFAULT_PARAMS["guidance_scale"],
+        ),
+        "shift": getattr(
+            args,
+            "ace_shift",
+            ACE_STEP_DEFAULT_PARAMS["shift"],
+        ),
     }
 
 
@@ -330,7 +443,42 @@ def load_adapter_metadata(directory: Path) -> dict[str, Any]:
 
 def resolve_model_source(
     supplied_source: str,
+    backend: str = DEFAULT_BACKEND,
+    model_revision: str | None = None,
 ) -> tuple[str, dict[str, Any]]:
+    if backend == "ace-step":
+        candidate = Path(supplied_source).expanduser()
+        if candidate.exists() or candidate.is_absolute() or supplied_source.startswith(
+            ("./", "../", "~")
+        ):
+            raise RuntimeError(
+                "ACE-Step currently requires a Hugging Face Diffusers model ID, "
+                "not a local model directory."
+            )
+        revision = model_revision
+        if revision is None and supplied_source == ACE_STEP_DEFAULT_MODEL:
+            revision = ACE_STEP_DEFAULT_REVISION
+        if revision is None:
+            raise RuntimeError(
+                "--model-revision is required for ACE-Step models other than "
+                f"{ACE_STEP_DEFAULT_MODEL}."
+            )
+        if not re.fullmatch(r"[0-9a-fA-F]{40}", revision):
+            raise RuntimeError(
+                "--model-revision must be a full 40-character Hugging Face commit."
+            )
+        return supplied_source, {
+            "type": "pretrained",
+            "backend": "ace-step",
+            "supplied": supplied_source,
+            "model_id": supplied_source,
+            "revision": revision.lower(),
+            "library": "diffusers",
+            "library_version": ACE_STEP_DIFFUSERS_VERSION,
+        }
+    if backend != "musicgen":
+        raise RuntimeError(f"Unsupported generation backend: {backend!r}")
+
     candidate = Path(supplied_source).expanduser()
     if candidate.exists():
         if not candidate.is_dir():
@@ -341,6 +489,7 @@ def resolve_model_source(
             package_sha256, file_count = model_package_digest(directory)
             return str(directory), {
                 "type": "lora_adapter",
+                "backend": "musicgen",
                 "supplied": supplied_source,
                 "path": display_path(directory),
                 "package_sha256": package_sha256,
@@ -364,6 +513,7 @@ def resolve_model_source(
         package_sha256, file_count = model_package_digest(directory)
         return str(directory), {
             "type": "local_package",
+            "backend": "musicgen",
             "supplied": supplied_source,
             "path": display_path(directory),
             "package_sha256": package_sha256,
@@ -375,6 +525,7 @@ def resolve_model_source(
 
     return supplied_source, {
         "type": "pretrained",
+        "backend": "musicgen",
         "supplied": supplied_source,
         "model_id": supplied_source,
         "audiocraft_commit": AUDIOCRAFT_COMMIT,
@@ -452,21 +603,49 @@ def build_locked_config(
         and args.adapter_scale != DEFAULT_ADAPTER_SCALE
     ):
         raise RuntimeError("--adapter-scale only applies to LoRA adapter models")
-    return {
-        "schema_version": 2,
+    backend = model_source.get(
+        "backend",
+        getattr(args, "backend", DEFAULT_BACKEND),
+    )
+    if backend not in BACKENDS:
+        raise RuntimeError(f"Unsupported generation backend: {backend!r}")
+    config = {
+        "schema_version": 3,
         "run_name": args.run_name,
+        "backend": backend,
         "model_source": model_source,
         "adapter_scale": args.adapter_scale,
-        "audiocraft_commit": AUDIOCRAFT_COMMIT,
         "generator_sha256": sha256_file(Path(__file__).resolve()),
         "prompt_manifest": display_path(PROMPTS_PATH),
         "prompt_manifest_sha256": prompt_sha256,
         "prompt_ids": [prompt["id"] for prompt in prompts],
         "seeds": args.seeds,
         "batch_size": args.batch_size,
-        "generation": generation_params(args.cfg_coef),
-        "audio_write": AUDIO_WRITE_PARAMS,
+        "generation": (
+            generation_params(args.cfg_coef)
+            if backend == "musicgen"
+            else ace_step_generation_params(args)
+        ),
+        "audio_write": (
+            AUDIO_WRITE_PARAMS
+            if backend == "musicgen"
+            else ACE_STEP_AUDIO_WRITE_PARAMS
+        ),
     }
+    if backend == "musicgen":
+        config["audiocraft_commit"] = AUDIOCRAFT_COMMIT
+    else:
+        config["ace_dtype"] = getattr(args, "ace_dtype", "auto")
+        config["ace_cpu_offload"] = getattr(args, "ace_cpu_offload", False)
+    return config
+
+
+def clip_backend_metadata(locked_config: dict[str, Any]) -> dict[str, Any]:
+    backend = locked_config.get("backend", DEFAULT_BACKEND)
+    metadata = {"backend": backend}
+    if backend == "musicgen":
+        metadata["audiocraft_commit"] = AUDIOCRAFT_COMMIT
+    return metadata
 
 
 def build_clip_plan(
@@ -581,8 +760,8 @@ def validate_completed_clips(
         expected = {
             **planned[clip_id],
             "model_source": locked_config["model_source"],
-            "audiocraft_commit": AUDIOCRAFT_COMMIT,
             "duration_seconds": locked_config["generation"]["duration"],
+            **clip_backend_metadata(locked_config),
         }
         for key, value in expected.items():
             if record.get(key) != value:
@@ -608,7 +787,7 @@ def seed_everything(torch: Any, seed: int, device: str) -> None:
         torch.cuda.manual_seed_all(seed)
 
 
-def generate(
+def generate_musicgen(
     args: argparse.Namespace,
     output_dir: Path,
     model_source: str,
@@ -671,6 +850,7 @@ def generate(
     runtime_path = output_dir / "runtime.json"
     runtime = {
         "started_at_utc": datetime.now(timezone.utc).isoformat(),
+        "backend": "musicgen",
         "python": platform.python_version(),
         "torch": torch.__version__,
         "cuda": torch.version.cuda,
@@ -747,7 +927,7 @@ def generate(
                 record = {
                     **clip,
                     "model_source": locked_config["model_source"],
-                    "audiocraft_commit": AUDIOCRAFT_COMMIT,
+                    **clip_backend_metadata(locked_config),
                     "sample_rate": model.sample_rate,
                     "duration_seconds": locked_config["generation"]["duration"],
                 }
@@ -763,6 +943,274 @@ def generate(
     print(f"run complete: {len(clip_plan)} clips in {output_dir}")
 
 
+def resolve_ace_step_dtype(torch: Any, requested: str, device: str) -> Any:
+    dtype_name = requested
+    if dtype_name == "auto":
+        dtype_name = "bfloat16" if device.startswith("cuda") else "float32"
+    if not device.startswith("cuda") and dtype_name == "float16":
+        raise RuntimeError(
+            "ACE-Step float16 inference requires CUDA; use --ace-dtype float32 "
+            "or bfloat16 on CPU."
+        )
+    return getattr(torch, dtype_name)
+
+
+def normalize_ace_step_audio(
+    torch: Any,
+    torchaudio: Any,
+    waveform: Any,
+    sample_rate: int,
+) -> Any:
+    energy = waveform.pow(2).mean().sqrt().item()
+    if energy >= 2e-3:
+        input_loudness_db = torchaudio.transforms.Loudness(sample_rate)(
+            waveform
+        ).item()
+        gain = 10.0 ** ((-14.0 - input_loudness_db) / 20.0)
+        waveform = torch.tanh(gain * waveform)
+    waveform = waveform.clamp(-1, 1)
+    if not waveform.isfinite().all():
+        raise RuntimeError("ACE-Step returned non-finite audio samples")
+    return waveform
+
+
+def load_ace_step_pipeline(
+    AceStepPipeline: Any,
+    torch: Any,
+    model_source: str,
+    model_source_record: dict[str, Any],
+    device: str,
+    requested_dtype: str,
+    cpu_offload: bool,
+) -> tuple[Any, Any]:
+    installed_diffusers = package_version("diffusers")
+    if installed_diffusers != ACE_STEP_DIFFUSERS_VERSION:
+        raise RuntimeError(
+            f"ACE-Step generation requires diffusers=={ACE_STEP_DIFFUSERS_VERSION}; "
+            f"found {installed_diffusers!r}."
+        )
+    dtype = resolve_ace_step_dtype(torch, requested_dtype, device)
+    pipeline = AceStepPipeline.from_pretrained(
+        model_source,
+        revision=model_source_record["revision"],
+        torch_dtype=dtype,
+    )
+    if cpu_offload:
+        if not device.startswith("cuda"):
+            raise RuntimeError("--ace-cpu-offload requires a CUDA device")
+        pipeline.enable_model_cpu_offload(device=device)
+    else:
+        pipeline = pipeline.to(device)
+    pipeline.vae.enable_tiling()
+    return pipeline, dtype
+
+
+def generate_ace_step(
+    args: argparse.Namespace,
+    output_dir: Path,
+    model_source: str,
+    locked_config: dict[str, Any],
+    clip_plan: list[dict[str, Any]],
+) -> None:
+    try:
+        import soundfile
+        import torch
+        import torchaudio
+        from diffusers import AceStepPipeline
+    except ImportError as error:
+        raise RuntimeError(
+            "ACE-Step generation requires a separate Python environment "
+            "installed from ace-step-requirements.txt."
+        ) from error
+
+    device = args.device
+    if device == "auto":
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+    if device.startswith("cuda") and not torch.cuda.is_available():
+        raise RuntimeError(f"CUDA was requested but is unavailable: {device}")
+
+    manifest_path, completed = prepare_output(output_dir, locked_config)
+    validate_completed_clips(output_dir, clip_plan, completed, locked_config)
+
+    pending = [clip for clip in clip_plan if clip["clip_id"] not in completed]
+    if not pending:
+        print(f"run already complete: {len(completed)} clips in {output_dir}")
+        return
+    generation_batches = build_generation_batches(clip_plan, args.batch_size)
+    pending_batches = [
+        (batch, [clip for clip in batch if clip["clip_id"] not in completed])
+        for batch in generation_batches
+    ]
+    pending_batches = [
+        (batch, pending_batch)
+        for batch, pending_batch in pending_batches
+        if pending_batch
+    ]
+
+    print(f"loading {args.model} on {device}...")
+    pipeline, dtype = load_ace_step_pipeline(
+        AceStepPipeline,
+        torch,
+        model_source,
+        locked_config["model_source"],
+        device,
+        locked_config["ace_dtype"],
+        locked_config["ace_cpu_offload"],
+    )
+    sample_rate = pipeline.sample_rate
+
+    runtime_path = output_dir / "runtime.json"
+    runtime = {
+        "started_at_utc": datetime.now(timezone.utc).isoformat(),
+        "backend": "ace-step",
+        "python": platform.python_version(),
+        "torch": torch.__version__,
+        "torchaudio": torchaudio.__version__,
+        "cuda": torch.version.cuda,
+        "diffusers": package_version("diffusers"),
+        "transformers": package_version("transformers"),
+        "soundfile": package_version("soundfile"),
+        "device": device,
+        "device_name": (
+            torch.cuda.get_device_name(torch.device(device))
+            if device.startswith("cuda")
+            else None
+        ),
+        "dtype": str(dtype).removeprefix("torch."),
+        "cpu_offload": locked_config["ace_cpu_offload"],
+        "sample_rate": sample_rate,
+    }
+    if runtime_path.exists():
+        try:
+            existing_runtime = json.loads(runtime_path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError as error:
+            raise RuntimeError(f"Invalid runtime metadata: {runtime_path}") from error
+        comparable_keys = set(runtime) - {"started_at_utc"}
+        if any(existing_runtime.get(key) != runtime[key] for key in comparable_keys):
+            raise RuntimeError(
+                f"Runtime environment differs from {runtime_path}; use a new run name."
+            )
+    else:
+        write_json(runtime_path, runtime)
+
+    generation = locked_config["generation"]
+    print(
+        f"generating {len(pending)} of {len(clip_plan)} clips "
+        f"in {len(pending_batches)} batches into {output_dir / 'audio'}"
+    )
+    generated_count = 0
+    with manifest_path.open("a", encoding="utf-8") as manifest_file:
+        for batch_index, (batch, pending_batch) in enumerate(
+            pending_batches, start=1
+        ):
+            for clip in pending_batch:
+                output_path = output_dir / clip["audio_path"]
+                if output_path.exists():
+                    raise RuntimeError(
+                        f"Refusing to overwrite untracked audio file: {output_path}"
+                    )
+
+            seed = batch[0]["seed"]
+            print(
+                f"[batch {batch_index}/{len(pending_batches)}] seed {seed}: "
+                f"{len(pending_batch)} pending of {len(batch)} clips"
+            )
+            seed_everything(torch, seed, device)
+            generator = torch.Generator(device=device).manual_seed(seed)
+            with torch.inference_mode():
+                result = pipeline(
+                    prompt=[clip["prompt"] for clip in batch],
+                    lyrics=[generation["lyrics"]] * len(batch),
+                    audio_duration=generation["duration"],
+                    task_type=generation["task_type"],
+                    num_inference_steps=generation["num_inference_steps"],
+                    guidance_scale=generation["guidance_scale"],
+                    shift=generation["shift"],
+                    generator=generator,
+                    output_type="pt",
+                )
+            waveforms = result.audios
+            if len(waveforms) != len(batch):
+                raise RuntimeError(
+                    "ACE-Step returned an unexpected number of waveforms: "
+                    f"expected {len(batch)}, got {len(waveforms)}"
+                )
+
+            for clip, waveform in zip(batch, waveforms):
+                if clip["clip_id"] in completed:
+                    continue
+                output_path = output_dir / clip["audio_path"]
+                waveform = waveform.detach().cpu().float()
+                if waveform.ndim != 2:
+                    raise RuntimeError(
+                        "ACE-Step returned a waveform with an unexpected shape: "
+                        f"{tuple(waveform.shape)}"
+                    )
+                waveform = normalize_ace_step_audio(
+                    torch,
+                    torchaudio,
+                    waveform,
+                    sample_rate,
+                )
+                soundfile.write(
+                    str(output_path),
+                    waveform.transpose(0, 1).numpy(),
+                    sample_rate,
+                    format="WAV",
+                    subtype=locked_config["audio_write"]["subtype"],
+                )
+                if not output_path.is_file():
+                    raise RuntimeError(
+                        f"ACE-Step did not create expected file: {output_path}"
+                    )
+
+                record = {
+                    **clip,
+                    "model_source": locked_config["model_source"],
+                    **clip_backend_metadata(locked_config),
+                    "sample_rate": sample_rate,
+                    "duration_seconds": generation["duration"],
+                }
+                manifest_file.write(json.dumps(record, ensure_ascii=False) + "\n")
+                manifest_file.flush()
+                os.fsync(manifest_file.fileno())
+                generated_count += 1
+                print(
+                    f"[{generated_count}/{len(pending)}] {clip['prompt_id']} "
+                    f"(seed {clip['seed']})"
+                )
+
+    print(f"run complete: {len(clip_plan)} clips in {output_dir}")
+
+
+def generate(
+    args: argparse.Namespace,
+    output_dir: Path,
+    model_source: str,
+    locked_config: dict[str, Any],
+    clip_plan: list[dict[str, Any]],
+) -> None:
+    backend = locked_config.get("backend", DEFAULT_BACKEND)
+    if backend == "musicgen":
+        generate_musicgen(
+            args,
+            output_dir,
+            model_source,
+            locked_config,
+            clip_plan,
+        )
+    elif backend == "ace-step":
+        generate_ace_step(
+            args,
+            output_dir,
+            model_source,
+            locked_config,
+            clip_plan,
+        )
+    else:
+        raise RuntimeError(f"Unsupported generation backend: {backend!r}")
+
+
 def main() -> None:
     args = parse_args()
     prompt_sha256 = verify_prompt_checksum()
@@ -771,7 +1219,11 @@ def main() -> None:
     if args.limit is not None:
         prompts = prompts[: args.limit]
 
-    model_source, model_source_record = resolve_model_source(args.model)
+    model_source, model_source_record = resolve_model_source(
+        args.model,
+        args.backend,
+        args.model_revision,
+    )
     locked_config = build_locked_config(
         args, prompts, prompt_sha256, model_source_record
     )
