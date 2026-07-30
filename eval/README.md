@@ -143,6 +143,79 @@ Generation defaults to one clip at a time. To use accelerator parallelism, add
 the batch size is locked in the run configuration, so use the same value for
 baseline and fine-tuned runs. Lower it if generation runs out of device memory.
 
+## Generate the ACE-Step 1.5 baseline
+
+ACE-Step generation uses the first-party
+[`diffusers.AceStepPipeline`](https://huggingface.co/docs/diffusers/api/pipelines/ace_step)
+and the official
+[`ACE-Step/acestep-v15-xl-turbo-diffusers`](https://huggingface.co/ACE-Step/acestep-v15-xl-turbo-diffusers)
+checkpoint. Its PyTorch requirements are newer than the AudioCraft environment,
+so run generation in a separate Python environment. The generated WAVs use the
+same run layout and are scored from the normal AudioCraft environment by the
+existing `score.py`.
+
+Inspect the locked ACE-Step configuration without loading model dependencies:
+
+```bash
+python eval/generate.py \
+  --backend ace-step \
+  --model ACE-Step/acestep-v15-xl-turbo-diffusers \
+  --run-name baseline_ace_step_15_xl_turbo \
+  --dry-run
+```
+
+Create and activate a local Python 3.11 virtual environment:
+
+```bash
+python3.11 -m venv .venv/ace-step
+source .venv/ace-step/bin/activate
+python -m pip install --upgrade pip
+python -m pip install -r ace-step-requirements.txt
+```
+
+Generate the complete ACE-Step baseline from the repository root:
+
+```bash
+python eval/generate.py \
+  --backend ace-step \
+  --model ACE-Step/acestep-v15-xl-turbo-diffusers \
+  --run-name baseline_ace_step_15_xl_turbo
+```
+
+`ace-step-requirements.txt` pins PyTorch, TorchAudio, Diffusers, Transformers,
+and the supporting packages. A Conda environment with Python 3.11 is also fine;
+install the same requirements file inside it. Do not install these versions
+over the repository's AudioCraft environment.
+
+The default ACE-Step checkpoint revision is pinned in `generate.py`. Other
+Diffusers-compatible ACE-Step model IDs require an exact 40-character
+`--model-revision`.
+
+For comparability with the MusicGen runs, ACE-Step receives every frozen prompt
+as its caption, uses `[Instrumental]` as the lyric control, generates 30 seconds,
+uses the same seeds and batching scheme, and receives the same -14 LUFS
+loudness normalization and soft compression before 16-bit WAV encoding. XL
+Turbo is guidance-distilled, so the locked defaults are eight denoising steps,
+guidance scale `1.0`, and timestep shift `3.0`. Override those with
+`--ace-steps`, `--ace-guidance-scale`, and `--ace-shift`; use a distinct run
+name for every parameter set. Add
+`--ace-cpu-offload` when the complete XL pipeline does not fit in CUDA memory;
+the offload choice is also locked into the run configuration.
+
+Score both runs with the same metrics and reference corpora:
+
+```bash
+deactivate  # Then reactivate the repository's normal AudioCraft environment.
+python eval/score.py --run-name baseline_musicgen_small
+python eval/score.py --run-name baseline_ace_step_15_xl_turbo
+```
+
+Compare the two `runs/<run-name>/metrics.json` files. CLAP consistency is higher
+when prompt alignment is better, CLAP seed diversity is higher when seeds produce
+more varied outputs, and KLD and FAD are lower when the generated distribution is
+closer to the named reference. Keep the generated prompt count, seed count,
+scorer, and FAD corpora identical when comparing runs.
+
 ## Generate a LoRA adapter run
 
 After `train_lora.sh` completes, export its best adapter state and pass the

@@ -280,17 +280,21 @@ def load_run(
     config = read_json(run_dir / "config.json")
     if config.get("run_name") != run_name:
         raise RuntimeError(f"Run name does not match {run_dir / 'config.json'}")
-    if config.get("schema_version") != 2:
+    schema_version = config.get("schema_version")
+    if schema_version not in (2, 3):
         raise RuntimeError(
-            f"Unsupported generated run schema: {config.get('schema_version')!r}"
+            f"Unsupported generated run schema: {schema_version!r}"
         )
 
+    backend = config.get("backend", "musicgen" if schema_version == 2 else None)
     prompt_ids = config.get("prompt_ids")
     seeds = config.get("seeds")
     model_source = config.get("model_source")
     adapter_scale = config.get("adapter_scale", 1.0)
     audiocraft_commit = config.get("audiocraft_commit")
     generation = config.get("generation")
+    if backend not in ("musicgen", "ace-step"):
+        raise RuntimeError(f"Run config contains an invalid backend: {backend!r}")
     if (
         not isinstance(prompt_ids, list)
         or not prompt_ids
@@ -307,6 +311,19 @@ def load_run(
         raise RuntimeError("Run config contains invalid seeds")
     if not isinstance(model_source, dict) or not model_source:
         raise RuntimeError("Run config contains an invalid model_source")
+    if schema_version == 3 and model_source.get("backend") != backend:
+        raise RuntimeError("Run config model_source does not match its backend")
+    if backend == "ace-step" and (
+        model_source.get("type") != "pretrained"
+        or not isinstance(model_source.get("model_id"), str)
+        or not model_source["model_id"]
+        or not isinstance(model_source.get("revision"), str)
+        or re.fullmatch(r"[0-9a-f]{40}", model_source["revision"]) is None
+        or model_source.get("library") != "diffusers"
+        or not isinstance(model_source.get("library_version"), str)
+        or not model_source["library_version"]
+    ):
+        raise RuntimeError("Run config contains invalid ACE-Step model provenance")
     if (
         isinstance(adapter_scale, bool)
         or not isinstance(adapter_scale, (int, float))
@@ -318,13 +335,16 @@ def load_run(
         raise RuntimeError(
             "Run config applies a non-default adapter_scale to a non-adapter model"
         )
-    if not isinstance(audiocraft_commit, str) or not audiocraft_commit:
-        raise RuntimeError("Run config contains an invalid audiocraft_commit")
-    if audiocraft_commit != AUDIOCRAFT_COMMIT:
-        raise RuntimeError(
-            f"Run uses AudioCraft {audiocraft_commit}, but this scorer is pinned to "
-            f"{AUDIOCRAFT_COMMIT}"
-        )
+    if backend == "musicgen":
+        if not isinstance(audiocraft_commit, str) or not audiocraft_commit:
+            raise RuntimeError("Run config contains an invalid audiocraft_commit")
+        if audiocraft_commit != AUDIOCRAFT_COMMIT:
+            raise RuntimeError(
+                f"Run uses AudioCraft {audiocraft_commit}, but this scorer is pinned "
+                f"to {AUDIOCRAFT_COMMIT}"
+            )
+    elif audiocraft_commit is not None:
+        raise RuntimeError("ACE-Step run config must not identify AudioCraft")
     if not isinstance(generation, dict):
         raise RuntimeError("Run config contains invalid generation settings")
     configured_duration = generation.get("duration")
@@ -360,8 +380,11 @@ def load_run(
         "duration_seconds",
         "sample_rate",
         "model_source",
-        "audiocraft_commit",
     }
+    if schema_version == 3:
+        required.add("backend")
+    if backend == "musicgen":
+        required.add("audiocraft_commit")
     for record in records:
         missing = required - record.keys()
         if missing:
@@ -408,7 +431,9 @@ def load_run(
             raise RuntimeError(f"Unexpected audio path for {clip_id}")
         if record["model_source"] != model_source:
             raise RuntimeError(f"Model source mismatch for {clip_id}")
-        if record["audiocraft_commit"] != audiocraft_commit:
+        if schema_version == 3 and record["backend"] != backend:
+            raise RuntimeError(f"Generation backend mismatch for {clip_id}")
+        if backend == "musicgen" and record["audiocraft_commit"] != audiocraft_commit:
             raise RuntimeError(f"AudioCraft commit mismatch for {clip_id}")
         resolve_run_audio(run_dir, record["audio_path"])
         by_clip_id[clip_id] = record
@@ -1677,6 +1702,7 @@ def main() -> None:
                         if uses_clap
                         else None
                     ),
+                    "run_backend": run_config.get("backend", "musicgen"),
                     "run_model_source": run_config.get("model_source"),
                     "run_adapter_scale": run_config.get("adapter_scale", 1.0),
                 },
@@ -1856,6 +1882,8 @@ def main() -> None:
     metrics_output = {
         "schema_version": 1,
         "run_name": args.run_name,
+        "backend": run_config.get("backend", "musicgen"),
+        "model_source": run_config.get("model_source"),
         "scored_at_utc": datetime.now(timezone.utc).isoformat(),
         "device": device,
         "torch": torch.__version__,

@@ -196,6 +196,58 @@ class EvalScoreTest(unittest.TestCase):
 
         self.assertNotIn("adapter_scale", loaded_config)
 
+    def test_loads_schema_three_ace_step_run(self) -> None:
+        run_dir = self.make_run()
+        model_source = {
+            "type": "pretrained",
+            "backend": "ace-step",
+            "model_id": "ACE-Step/acestep-v15-xl-turbo-diffusers",
+            "revision": "a" * 40,
+            "library": "diffusers",
+            "library_version": "0.39.0",
+        }
+        config_path = run_dir / "config.json"
+        config = json.loads(config_path.read_text(encoding="utf-8"))
+        config["schema_version"] = 3
+        config["backend"] = "ace-step"
+        config["model_source"] = model_source
+        config.pop("audiocraft_commit")
+        config_path.write_text(json.dumps(config), encoding="utf-8")
+
+        manifest_path = run_dir / "manifest.jsonl"
+        record = json.loads(manifest_path.read_text(encoding="utf-8"))
+        record["backend"] = "ace-step"
+        record["model_source"] = model_source
+        record.pop("audiocraft_commit")
+        record["sample_rate"] = 48_000
+        manifest_path.write_text(json.dumps(record) + "\n", encoding="utf-8")
+
+        _, loaded_config, records = score.load_run("test-run")
+
+        self.assertEqual(loaded_config["backend"], "ace-step")
+        self.assertEqual(records[0]["backend"], "ace-step")
+        self.assertNotIn("audiocraft_commit", records[0])
+
+    def test_loads_schema_three_musicgen_run(self) -> None:
+        run_dir = self.make_run()
+        config_path = run_dir / "config.json"
+        config = json.loads(config_path.read_text(encoding="utf-8"))
+        config["schema_version"] = 3
+        config["backend"] = "musicgen"
+        config["model_source"]["backend"] = "musicgen"
+        config_path.write_text(json.dumps(config), encoding="utf-8")
+
+        manifest_path = run_dir / "manifest.jsonl"
+        record = json.loads(manifest_path.read_text(encoding="utf-8"))
+        record["backend"] = "musicgen"
+        record["model_source"]["backend"] = "musicgen"
+        manifest_path.write_text(json.dumps(record) + "\n", encoding="utf-8")
+
+        _, loaded_config, records = score.load_run("test-run")
+
+        self.assertEqual(loaded_config["backend"], "musicgen")
+        self.assertEqual(records[0]["backend"], "musicgen")
+
     def test_rejects_non_default_adapter_scale_for_pretrained_model(self) -> None:
         run_dir = self.make_run()
         config_path = run_dir / "config.json"

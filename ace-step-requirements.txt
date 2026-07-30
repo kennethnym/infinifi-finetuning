@@ -1,0 +1,11 @@
+# Standalone ACE-Step 1.5 evaluation environment. Keep this separate from the
+# AudioCraft environment: Diffusers 0.39 requires a newer PyTorch stack.
+accelerate==1.12.0
+diffusers==0.39.0
+huggingface-hub==0.36.0
+safetensors==0.8.0
+soundfile==0.13.1
+tokenizers==0.22.1
+torch==2.7.1
+torchaudio==2.7.1
+transformers==4.57.6
