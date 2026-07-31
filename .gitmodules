@@ -1,3 +1,6 @@
 [submodule "audiocraft"]
 	path = audiocraft
 	url = https://github.com/facebookresearch/audiocraft.git
+[submodule "ace-step"]
+	path = ace-step
+	url = https://github.com/ACE-Step/ACE-Step-1.5.git

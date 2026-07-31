@@ -163,30 +163,32 @@ python eval/generate.py \
   --dry-run
 ```
 
-Clone the official source at the revision pinned by `generate.py`, then let its
-`uv.lock` create the local Python 3.11/3.12 environment:
+Initialize the pinned ACE-Step submodule, then let its `uv.lock` create the
+local Python 3.11/3.12 environment:
 
 ```bash
-git clone https://github.com/ACE-Step/ACE-Step-1.5.git ../ACE-Step-1.5
-git -C ../ACE-Step-1.5 checkout dce621408bee8c31b4fcf4811682eb9359e1bc94
-uv sync --project ../ACE-Step-1.5 --frozen
+git submodule update --init ace-step
+uv sync --project ace-step --frozen
 ```
 
 From this repository's root, run the evaluator inside that environment:
 
 ```bash
-uv run --project ../ACE-Step-1.5 --frozen python "$(pwd)/eval/generate.py" \
+uv run --project ace-step --frozen python "$(pwd)/eval/generate.py" \
   --backend ace-step \
   --model ACE-Step/Ace-Step1.5 \
   --run-name baseline_ace_step_15_2b_turbo
 ```
 
-The evaluator verifies the ACE-Step source commit and package version. It also
-downloads the Hugging Face snapshot at the exact model revision pinned in
-`generate.py`. Checkpoints default to `~/.cache/ace-step/checkpoints`; override
-that with `--ace-checkpoints-dir` or `ACESTEP_CHECKPOINTS_DIR`. The official
-unified snapshot also contains the 1.7B language-model weights, but this eval
-does not initialize or use that planner.
+Fresh clones can use `git clone --recurse-submodules`; after pulling a commit
+that first adds the submodule, run the explicit `git submodule update` command
+above. The evaluator verifies that the active `ace-step` package comes from the
+pinned submodule commit and package version. It also downloads the Hugging Face
+snapshot at the exact model revision pinned in `generate.py`. Checkpoints
+default to `~/.cache/ace-step/checkpoints`; override that with
+`--ace-checkpoints-dir` or `ACESTEP_CHECKPOINTS_DIR`. The official unified
+snapshot also contains the 1.7B language-model weights, but this eval does not
+initialize or use that planner.
 
 For comparability with the MusicGen runs, ACE-Step receives every frozen prompt
 as its caption, uses `[Instrumental]` as the lyric control, generates 30 seconds,
