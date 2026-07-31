@@ -285,6 +285,11 @@ python eval/generate.py \
   --run-name finetuned_infinifi
 ```
 
+The same export path supports compact models trained by `train_scratch.sh`;
+their resolved student architecture is stored in the Dora checkpoint. Use a
+distinct run name such as `scratch_lofi_77m_cfg3` when comparing against
+MusicGen-Small, MusicGen-Large, ACE-Step, and the production LoRA package.
+
 Use the actual signature from the training run. The exporter refuses to
 overwrite a non-empty directory unless it is already a complete export for the
 same signature with matching file hashes.

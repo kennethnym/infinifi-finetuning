@@ -29,6 +29,14 @@ class LoRAPatchIntegrationTest(unittest.TestCase):
             "apply /workspace/patches/audiocraft-lora.patch",
             dockerfile,
         )
+        self.assertIn(
+            "apply --check /workspace/patches/audiocraft-scratch.patch",
+            dockerfile,
+        )
+        self.assertIn(
+            "apply /workspace/patches/audiocraft-scratch.patch",
+            dockerfile,
+        )
 
         for relative_path in (
             "export_adapter.py",
@@ -57,6 +65,25 @@ class LoRAPatchIntegrationTest(unittest.TestCase):
             expected_headers.issubset(set(patch.splitlines())),
             expected_headers - set(patch.splitlines()),
         )
+
+    def test_scratch_patch_contains_full_model_distillation_support(self) -> None:
+        patch = (
+            PROJECT_ROOT / "patches" / "audiocraft-scratch.patch"
+        ).read_text(encoding="utf-8")
+        expected_headers = {
+            "diff --git a/audiocraft/solvers/base.py b/audiocraft/solvers/base.py",
+            "diff --git a/audiocraft/solvers/builders.py b/audiocraft/solvers/builders.py",
+            "diff --git a/audiocraft/solvers/musicgen.py b/audiocraft/solvers/musicgen.py",
+            "diff --git a/config/model/lm/model_scale/lofi_student.yaml b/config/model/lm/model_scale/lofi_student.yaml",
+            "diff --git a/config/solver/musicgen/default.yaml b/config/solver/musicgen/default.yaml",
+        }
+        self.assertTrue(
+            expected_headers.issubset(set(patch.splitlines())),
+            expected_headers - set(patch.splitlines()),
+        )
+        self.assertIn("_scheduled_distillation_weights", patch)
+        self.assertIn("grad_accumulation_steps", patch)
+        self.assertIn("self.compression_model.requires_grad_(False)", patch)
 
 
 if __name__ == "__main__":

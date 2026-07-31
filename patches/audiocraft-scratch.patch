@@ -1,0 +1,367 @@
+diff --git a/audiocraft/solvers/base.py b/audiocraft/solvers/base.py
+index 0432e44..a8a4ea7 100644
+--- a/audiocraft/solvers/base.py
++++ b/audiocraft/solvers/base.py
+@@ -74,6 +74,7 @@ class StandardSolver(ABC, flashy.BaseSolver):
+         self.train_updates_per_epoch = len(self.dataloaders['train']) if 'train' in self.dataloaders else 0
+         if self.cfg.optim.updates_per_epoch:
+             self.train_updates_per_epoch = self.cfg.optim.updates_per_epoch
++        self.train_batches_per_epoch = self.train_updates_per_epoch
+         self.total_updates = self.train_updates_per_epoch * self.cfg.optim.epochs
+         # instantiate model & exponential moving average on the model
+         self.build_model()
+@@ -523,7 +524,7 @@ class StandardSolver(ABC, flashy.BaseSolver):
+         if flashy.distrib.world_size() > 1 \
+            and isinstance(loader.sampler, torch.utils.data.distributed.DistributedSampler):
+             loader.sampler.set_epoch(self.epoch)
+-        updates_per_epoch = self.train_updates_per_epoch if self.is_training else len(loader)
++        updates_per_epoch = self.train_batches_per_epoch if self.is_training else len(loader)
+         if self.cfg.benchmark_no_load:
+             self.logger.warning("Fake loading for benchmarking: re-using first batch")
+             batch = next(iter(loader))
+diff --git a/audiocraft/solvers/builders.py b/audiocraft/solvers/builders.py
+index bf18f2d..3ead472 100644
+--- a/audiocraft/solvers/builders.py
++++ b/audiocraft/solvers/builders.py
+@@ -339,8 +339,10 @@ def get_audio_datasets(cfg: omegaconf.DictConfig,
+         kwargs['channels'] = channels
+ 
+         if kwargs.get('permutation_on_files') and cfg.optim.updates_per_epoch:
++            accumulation_steps = int(cfg.optim.get('grad_accumulation_steps', 1))
+             kwargs['num_samples'] = (
+-                flashy.distrib.world_size() * cfg.dataset.batch_size * cfg.optim.updates_per_epoch)
++                flashy.distrib.world_size() * cfg.dataset.batch_size
++                * cfg.optim.updates_per_epoch * accumulation_steps)
+ 
+         num_samples = kwargs['num_samples']
+         shuffle = kwargs['shuffle']
+diff --git a/audiocraft/solvers/musicgen.py b/audiocraft/solvers/musicgen.py
+index 93e4e8e..9c44494 100644
+--- a/audiocraft/solvers/musicgen.py
++++ b/audiocraft/solvers/musicgen.py
+@@ -118,6 +118,8 @@ class MusicGenSolver(base.StandardSolver):
+             'lr': '.2E',
+             'loss': '.3f',
+             'kd': '.3f',
++            'kd_weight': '.3f',
++            'ce_weight': '.3f',
+             'ce': '.3f',
+             'ppl': '.3f',
+             'grad_norm': '.3E',
+@@ -133,6 +135,8 @@ class MusicGenSolver(base.StandardSolver):
+         # (e.g. we trained the model with quantizers dropout)
+         self.compression_model = CompressionSolver.wrapped_model_from_checkpoint(
+             self.cfg, self.cfg.compression_model_checkpoint, device=self.device)
++        self.compression_model.requires_grad_(False)
++        self.compression_model.eval()
+         assert self.compression_model.sample_rate == self.cfg.sample_rate, (
+             f"Compression model sample rate is {self.compression_model.sample_rate} but "
+             f"Solver sample rate is {self.cfg.sample_rate}."
+@@ -154,6 +158,25 @@ class MusicGenSolver(base.StandardSolver):
+         # instantiate LM model
+         self.model: models.LMModel = models.builders.get_lm_model(self.cfg).to(self.device)
+         self.teacher_model: tp.Optional[models.LMModel] = None
++        accumulation_steps = self.cfg.optim.get('grad_accumulation_steps', 1)
++        if (
++            isinstance(accumulation_steps, bool)
++            or not isinstance(accumulation_steps, int)
++            or accumulation_steps < 1
++        ):
++            raise ValueError("Gradient accumulation steps must be a positive integer.")
++        self.gradient_accumulation_steps = accumulation_steps
++        self.train_batches_per_epoch = (
++            self.train_updates_per_epoch * self.gradient_accumulation_steps)
++        if (
++            'train' in self.dataloaders
++            and len(self.dataloaders['train']) < self.train_batches_per_epoch
++        ):
++            raise ValueError(
++                "The training loader does not contain enough microbatches for "
++                f"{self.train_updates_per_epoch} optimizer updates with "
++                f"{self.gradient_accumulation_steps} accumulation steps."
++            )
+         optimizer_parameters = None
+         if self.model.lora_config.enabled:
+             if self.cfg.fsdp.use:
+@@ -171,19 +194,41 @@ class MusicGenSolver(base.StandardSolver):
+             distillation_cfg is not None
+             and bool(distillation_cfg.get('enabled', False))
+         ):
+-            if not self.model.lora_config.enabled:
+-                raise ValueError("MusicGen distillation requires LoRA to be enabled.")
+             if distillation_cfg.temperature <= 0:
+                 raise ValueError("Distillation temperature must be positive.")
+-            if distillation_cfg.kl_weight <= 0:
+-                raise ValueError("Distillation KL weight must be positive.")
+-            if distillation_cfg.ce_weight < 0:
+-                raise ValueError("Distillation CE weight must be non-negative.")
++            weight_names = (
++                'kl_weight', 'ce_weight',
++                'initial_kl_weight', 'initial_ce_weight',
++            )
++            for weight_name in weight_names:
++                if distillation_cfg[weight_name] < 0:
++                    raise ValueError(
++                        f"Distillation {weight_name} must be non-negative.")
++            if (
++                distillation_cfg.kl_weight == 0
++                and distillation_cfg.ce_weight == 0
++            ):
++                raise ValueError("Final distillation weights cannot both be zero.")
++            if (
++                distillation_cfg.initial_kl_weight == 0
++                and distillation_cfg.initial_ce_weight == 0
++            ):
++                raise ValueError("Initial distillation weights cannot both be zero.")
++            schedule_updates = distillation_cfg.weight_schedule_updates
++            if (
++                isinstance(schedule_updates, bool)
++                or not isinstance(schedule_updates, int)
++                or schedule_updates < 0
++            ):
++                raise ValueError(
++                    "Distillation weight schedule updates must be a non-negative integer."
++                )
+             teacher_checkpoint = str(distillation_cfg.teacher_checkpoint).strip()
+             if not teacher_checkpoint:
+                 raise ValueError("Distillation teacher checkpoint must be non-empty.")
+             if (
+                 distillation_cfg.cfg_branches
++                and self.model.lora_config.enabled
+                 and self.model.lora_config.condition_gated
+             ):
+                 raise ValueError(
+@@ -219,11 +264,15 @@ class MusicGenSolver(base.StandardSolver):
+                 parameter.numel() for parameter in self.teacher_model.parameters())
+             self.logger.info(
+                 "Distilling from frozen %.2f B parameter teacher with "
+-                "temperature %.2f, KL weight %.3f, and CE weight %.3f.",
++                "temperature %.2f, KL weight %.3f -> %.3f, and "
++                "CE weight %.3f -> %.3f over %d updates.",
+                 teacher_parameters / 1e9,
+                 distillation_cfg.temperature,
++                distillation_cfg.initial_kl_weight,
+                 distillation_cfg.kl_weight,
++                distillation_cfg.initial_ce_weight,
+                 distillation_cfg.ce_weight,
++                distillation_cfg.weight_schedule_updates,
+             )
+         if self.cfg.fsdp.use:
+             assert not self.cfg.autocast, "Cannot use autocast with fsdp"
+@@ -232,6 +281,13 @@ class MusicGenSolver(base.StandardSolver):
+         # initialize optimization
+         if optimizer_parameters is None:
+             optimizer_parameters = builders.get_optim_parameter_groups(self.model)
++            trainable = sum(
++                parameter.numel()
++                for parameter in self.model.parameters()
++                if parameter.requires_grad)
++            self.logger.info(
++                "Training MusicGen with %.2f M full-model parameters.",
++                trainable / 1e6)
+         self.optimizer = builders.get_optimizer(optimizer_parameters, self.cfg.optim)
+         self.lr_scheduler = builders.get_lr_scheduler(self.optimizer, self.cfg.schedule, self.total_updates)
+         self.register_stateful('model', 'optimizer', 'lr_scheduler')
+@@ -373,6 +429,41 @@ class MusicGenSolver(base.StandardSolver):
+             kd_per_codebook.append(codebook_kd.detach())
+         return kd / codebooks, kd_per_codebook
+ 
++    @staticmethod
++    def _scheduled_distillation_weights(
++        initial_kl_weight: float,
++        final_kl_weight: float,
++        initial_ce_weight: float,
++        final_ce_weight: float,
++        schedule_updates: int,
++        completed_updates: int,
++    ) -> tp.Tuple[float, float]:
++        """Linearly transition CE and KD weights by optimizer update."""
++        if schedule_updates == 0:
++            return final_kl_weight, final_ce_weight
++        progress = min(max(completed_updates / schedule_updates, 0.0), 1.0)
++        kl_weight = initial_kl_weight + progress * (
++            final_kl_weight - initial_kl_weight)
++        ce_weight = initial_ce_weight + progress * (
++            final_ce_weight - initial_ce_weight)
++        return kl_weight, ce_weight
++
++    def _distillation_weights(self, batch_index: int) -> tp.Tuple[float, float]:
++        completed_updates = max(self.epoch - 1, 0) * self.train_updates_per_epoch
++        if self.is_training:
++            completed_updates += batch_index // self.gradient_accumulation_steps
++        else:
++            completed_updates += self.train_updates_per_epoch
++        cfg = self.cfg.distillation
++        return self._scheduled_distillation_weights(
++            float(cfg.initial_kl_weight),
++            float(cfg.kl_weight),
++            float(cfg.initial_ce_weight),
++            float(cfg.ce_weight),
++            int(cfg.weight_schedule_updates),
++            completed_updates,
++        )
++
+     @staticmethod
+     def _concatenate_condition_tensors(
+         conditional: tp.Dict[str, ConditionType],
+@@ -575,6 +666,8 @@ class MusicGenSolver(base.StandardSolver):
+             torch.cuda.set_sync_debug_mode('warn')
+ 
+         teacher_output = None
++        kd_weight = None
++        ce_weight = None
+         if self.teacher_model is not None:
+             teacher_attributes = self._distillation_attributes(batch)
+             if self.cfg.distillation.cfg_branches:
+@@ -610,9 +703,10 @@ class MusicGenSolver(base.StandardSolver):
+                 mask &= teacher_output.mask
+                 kd, kd_per_codebook = self._compute_distillation_kl(
+                     logits, teacher_output.logits, mask)
++                kd_weight, ce_weight = self._distillation_weights(idx)
+                 loss = (
+-                    float(self.cfg.distillation.kl_weight) * kd
+-                    + float(self.cfg.distillation.ce_weight) * ce
++                    kd_weight * kd
++                    + ce_weight * ce
+                 )
+         objective = loss
+         self.deadlock_detect.update('loss')
+@@ -622,39 +716,48 @@ class MusicGenSolver(base.StandardSolver):
+ 
+         if self.is_training:
+             metrics['lr'] = self.optimizer.param_groups[0]['lr']
++            should_step = (
++                (idx + 1) % self.gradient_accumulation_steps == 0)
++            if idx % self.gradient_accumulation_steps == 0:
++                self.optimizer.zero_grad()
++            loss = loss / self.gradient_accumulation_steps
+             if self.scaler is not None:
+                 loss = self.scaler.scale(loss)
+             self.deadlock_detect.update('scale')
+             if self.cfg.fsdp.use:
+                 loss.backward()
+-                flashy.distrib.average_tensors(self.model.buffers())
+-            elif self.cfg.optim.eager_sync:
++                if should_step:
++                    flashy.distrib.average_tensors(self.model.buffers())
++            elif (
++                self.cfg.optim.eager_sync
++                and self.gradient_accumulation_steps == 1
++            ):
+                 with flashy.distrib.eager_sync_model(self.model):
+                     loss.backward()
+             else:
+-                # this should always be slower but can be useful
+-                # for weird use cases like multiple backwards.
+                 loss.backward()
+-                flashy.distrib.sync_model(self.model)
++                if should_step:
++                    flashy.distrib.sync_model(self.model)
+             self.deadlock_detect.update('backward')
+ 
+-            if self.scaler is not None:
+-                self.scaler.unscale_(self.optimizer)
+-            if self.cfg.optim.max_norm:
+-                if self.cfg.fsdp.use:
+-                    metrics['grad_norm'] = self.model.clip_grad_norm_(self.cfg.optim.max_norm)  # type: ignore
++            if should_step:
++                if self.scaler is not None:
++                    self.scaler.unscale_(self.optimizer)
++                if self.cfg.optim.max_norm:
++                    if self.cfg.fsdp.use:
++                        metrics['grad_norm'] = self.model.clip_grad_norm_(self.cfg.optim.max_norm)  # type: ignore
++                    else:
++                        metrics['grad_norm'] = torch.nn.utils.clip_grad_norm_(
++                            self.model.parameters(), self.cfg.optim.max_norm
++                        )
++                if self.scaler is None:
++                    self.optimizer.step()
+                 else:
+-                    metrics['grad_norm'] = torch.nn.utils.clip_grad_norm_(
+-                        self.model.parameters(), self.cfg.optim.max_norm
+-                    )
+-            if self.scaler is None:
+-                self.optimizer.step()
+-            else:
+-                self.scaler.step(self.optimizer)
+-                self.scaler.update()
+-            if self.lr_scheduler:
+-                self.lr_scheduler.step()
+-            self.optimizer.zero_grad()
++                    self.scaler.step(self.optimizer)
++                    self.scaler.update()
++                if self.lr_scheduler:
++                    self.lr_scheduler.step()
++                self.optimizer.zero_grad()
+             self.deadlock_detect.update('optim')
+             if self.scaler is not None:
+                 scale = self.scaler.get_scale()
+@@ -667,6 +770,8 @@ class MusicGenSolver(base.StandardSolver):
+         if kd is not None:
+             metrics['loss'] = objective.detach()
+             metrics['kd'] = kd.detach()
++            metrics['kd_weight'] = kd_weight
++            metrics['ce_weight'] = ce_weight
+             for k, kd_q in enumerate(kd_per_codebook):
+                 metrics[f'kd_q{k + 1}'] = kd_q
+         for k, ce_q in enumerate(ce_per_codebook):
+diff --git a/config/model/lm/model_scale/lofi_student.yaml b/config/model/lm/model_scale/lofi_student.yaml
+new file mode 100644
+index 0000000..1caee34
+--- /dev/null
++++ b/config/model/lm/model_scale/lofi_student.yaml
+@@ -0,0 +1,7 @@
++# @package _global_
++
++# Compact ~77M parameter MusicGen student for lo-fi specialization.
++transformer_lm:
++  dim: 640
++  num_heads: 10
++  num_layers: 10
+diff --git a/config/solver/musicgen/default.yaml b/config/solver/musicgen/default.yaml
+index 5571b6a..ac1c96e 100644
+--- a/config/solver/musicgen/default.yaml
++++ b/config/solver/musicgen/default.yaml
+@@ -40,6 +40,9 @@ distillation:
+   temperature: 2.0
+   kl_weight: 0.75
+   ce_weight: 0.25
++  initial_kl_weight: 0.75
++  initial_ce_weight: 0.25
++  weight_schedule_updates: 0
+   cfg_branches: true
+ 
+ 
+@@ -124,6 +127,7 @@ checkpoint:
+ optim:
+   epochs: 200
+   updates_per_epoch: 2000
++  grad_accumulation_steps: 1
+   lr: 1e-4
+   optimizer: adamw
+   max_norm: 1.0
+diff --git a/tests/solvers/test_musicgen_distillation.py b/tests/solvers/test_musicgen_distillation.py
+index 81b856d..19c15bf 100644
+--- a/tests/solvers/test_musicgen_distillation.py
++++ b/tests/solvers/test_musicgen_distillation.py
+@@ -65,6 +65,20 @@ def test_distillation_kl_rejects_incompatible_logits():
+             solver(), student, teacher, mask)
+ 
+ 
++def test_distillation_weights_transition_by_optimizer_update():
++    weights = MusicGenSolver._scheduled_distillation_weights(
++        0.5, 0.75, 0.5, 0.25, 10_000, 5_000)
++
++    assert weights == pytest.approx((0.625, 0.375))
++
++
++def test_zero_length_distillation_schedule_uses_final_weights():
++    weights = MusicGenSolver._scheduled_distillation_weights(
++        0.5, 0.75, 0.5, 0.25, 0, 0)
++
++    assert weights == pytest.approx((0.75, 0.25))
++
++
+ def test_condition_tensors_are_padded_and_concatenated_by_branch():
+     conditional = {
+         "description": (
