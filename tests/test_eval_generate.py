@@ -65,6 +65,55 @@ class EvalGenerateTest(unittest.TestCase):
                 "ace-step",
             )
 
+    def test_reports_uninitialized_ace_step_submodule(self) -> None:
+        with (
+            tempfile.TemporaryDirectory() as temporary_directory,
+            mock.patch.object(
+                generate,
+                "ACE_STEP_SOURCE_DIR",
+                Path(temporary_directory) / "ace-step",
+            ),
+            self.assertRaisesRegex(
+                RuntimeError,
+                "git submodule update --init ace-step",
+            ),
+        ):
+            generate.require_ace_step_submodule()
+
+    def test_reports_missing_ace_step_environment_dependency(self) -> None:
+        real_import = __import__
+
+        def fail_soundfile_import(
+            name: str,
+            globals: object = None,
+            locals: object = None,
+            fromlist: object = (),
+            level: int = 0,
+        ) -> object:
+            if name == "soundfile":
+                raise ImportError("No module named 'soundfile'", name="soundfile")
+            return real_import(name, globals, locals, fromlist, level)
+
+        with (
+            mock.patch.object(
+                generate,
+                "require_ace_step_submodule",
+                return_value=Path("/ace-step"),
+            ),
+            mock.patch("builtins.__import__", side_effect=fail_soundfile_import),
+            self.assertRaisesRegex(
+                RuntimeError,
+                "could not import 'soundfile'.*uv sync --project ace-step",
+            ),
+        ):
+            generate.generate_ace_step(
+                SimpleNamespace(),
+                Path("/unused"),
+                generate.ACE_STEP_DEFAULT_MODEL,
+                {},
+                [],
+            )
+
     def test_builds_locked_ace_step_config(self) -> None:
         args = SimpleNamespace(
             backend="ace-step",
@@ -649,6 +698,11 @@ class EvalGenerateTest(unittest.TestCase):
                     generate,
                     "package_version",
                     side_effect=lambda name: versions.get(name),
+                ),
+                mock.patch.object(
+                    generate,
+                    "require_ace_step_submodule",
+                    return_value=Path("/ace-step-source"),
                 ),
                 mock.patch.object(
                     generate,

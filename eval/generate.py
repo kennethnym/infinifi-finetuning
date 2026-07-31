@@ -19,6 +19,7 @@ EVAL_DIR = Path(__file__).resolve().parent
 PROMPTS_PATH = EVAL_DIR / "prompts.jsonl"
 CHECKSUM_PATH = EVAL_DIR / "prompts.sha256"
 RUNS_ROOT = PROJECT_ROOT / "runs"
+ACE_STEP_SOURCE_DIR = PROJECT_ROOT / "ace-step"
 
 AUDIOCRAFT_COMMIT = "adf0b04a4452f171970028fcf80f101dd5e26e19"
 AUDIOCRAFT_PATCH = PROJECT_ROOT / "patches" / "audiocraft-lora.patch"
@@ -1003,7 +1004,24 @@ def resolve_ace_step_checkpoints_dir(supplied: str | None) -> Path:
     return directory
 
 
+def require_ace_step_submodule() -> Path:
+    source_root = ACE_STEP_SOURCE_DIR.resolve()
+    required_files = (
+        source_root / "pyproject.toml",
+        source_root / "uv.lock",
+        source_root / "acestep" / "handler.py",
+    )
+    if any(not path.is_file() for path in required_files):
+        raise RuntimeError(
+            "ACE-Step submodule is not initialized. Run "
+            "`git submodule update --init ace-step`, then "
+            "`uv sync --project ace-step --frozen`."
+        )
+    return source_root
+
+
 def verify_ace_step_source_checkout(AceStepHandler: Any) -> tuple[Path, str]:
+    source_root = require_ace_step_submodule()
     installed_version = package_version("ace-step")
     if installed_version != ACE_STEP_PACKAGE_VERSION:
         raise RuntimeError(
@@ -1016,14 +1034,11 @@ def verify_ace_step_source_checkout(AceStepHandler: Any) -> tuple[Path, str]:
     if module_file is None:
         raise RuntimeError("Cannot locate the installed ACE-Step source checkout")
     source_path = Path(module_file).resolve()
-    source_root = next(
-        (parent for parent in source_path.parents if (parent / ".git").exists()),
-        None,
-    )
-    if source_root is None:
+    if not source_path.is_relative_to(source_root):
         raise RuntimeError(
-            "ACE-Step must be installed from the pinned source checkout documented "
-            "in eval/README.md."
+            "The active Python environment loaded ACE-Step from outside this "
+            f"repository's submodule: {source_path}. Run the evaluator with "
+            "`uv run --project ace-step --frozen python ...`."
         )
 
     revision_result = subprocess.run(
@@ -1112,6 +1127,7 @@ def generate_ace_step(
     locked_config: dict[str, Any],
     clip_plan: list[dict[str, Any]],
 ) -> None:
+    require_ace_step_submodule()
     try:
         import soundfile
         import torch
@@ -1124,9 +1140,12 @@ def generate_ace_step(
         )
         from huggingface_hub import snapshot_download
     except ImportError as error:
+        missing_dependency = getattr(error, "name", None) or str(error)
         raise RuntimeError(
-            "ACE-Step 2B generation requires the pinned official source environment "
-            "documented in eval/README.md."
+            "ACE-Step 2B generation could not import "
+            f"{missing_dependency!r}. Install the submodule environment with "
+            "`uv sync --project ace-step --frozen`, then run this command through "
+            "`uv run --project ace-step --frozen python ...`."
         ) from error
 
     device = args.device
