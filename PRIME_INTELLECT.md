@@ -275,6 +275,61 @@ python eval/generate.py \
 Use scale `0` for a base-model equivalence check. Non-default values are only
 accepted for LoRA adapter packages.
 
+### From-scratch compact student distillation
+
+`train_scratch.sh` randomly initializes only the music-token LM. Its default
+student is a MusicGen-compatible 10-layer, width-640 transformer with 10 heads
+(about 77M trainable parameters), four EnCodec codebooks, and cardinality 2048.
+The pretrained EnCodec model and T5 backbone are frozen; the student's small
+T5-to-LM projection remains trainable because its output width is student-specific.
+MusicGen-Large is loaded frozen and is never stored in the student checkpoint.
+
+The default first stage is 20,000 optimizer updates over random 10-second crops.
+Batch size 1 with eight-way gradient accumulation gives an effective per-GPU
+batch of eight. `updates-per-epoch` continues to mean optimizer updates, not
+microbatches. Both CFG branches are distilled explicitly, and loss weights
+move linearly from `0.5 KD + 0.5 CE` to `0.75 KD + 0.25 CE` during the first
+10,000 updates:
+
+```bash
+bash train_scratch.sh
+```
+
+First validate the path by overfitting a fixed 100–500-record manifest. The
+manifest rows can refer to the existing prepared audio and metadata:
+
+```bash
+mkdir -p /workspace/egs/overfit
+head -n 250 audiocraft/egs/train/data.jsonl > /workspace/egs/overfit/data.jsonl
+bash train_scratch.sh \
+  --train-data /workspace/egs/overfit \
+  --epochs 2 \
+  --updates-per-epoch 100 \
+  --segment-duration 5 \
+  --weight-transition-updates 100
+```
+
+For the 20-second continuation, start a new Dora experiment from the stage-one
+student. Keep the architecture unchanged and begin directly at the final loss
+mixture:
+
+```bash
+bash train_scratch.sh \
+  --continue-from "//sig/$STAGE_ONE_SIGNATURE" \
+  --segment-duration 20 \
+  --epochs 30 \
+  --updates-per-epoch 1000 \
+  --initial-kd-weight 0.75 \
+  --initial-ce-weight 0.25 \
+  --weight-transition-updates 0
+```
+
+Export it with `export_checkpoint.py`, then use the normal local-package
+generation and scoring commands. Run `bash train_scratch.sh --help` for model,
+loss, accumulation, crop, resume, and manifest controls. The Large teacher's
+CC-BY-NC weight license still requires legal review for commercial use of the
+distilled student.
+
 ### Full-model fine-tuning (legacy)
 
 `train.sh` fine-tunes the pretrained `facebook/musicgen-small` model on the
