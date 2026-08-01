@@ -283,6 +283,14 @@ student is a MusicGen-compatible 10-layer, width-640 transformer with 10 heads
 The pretrained EnCodec model and T5 backbone are frozen; the student's small
 T5-to-LM projection remains trainable because its output width is student-specific.
 MusicGen-Large is loaded frozen and is never stored in the student checkpoint.
+The Docker image applies both AudioCraft patches automatically. For a local
+checkout, apply `patches/audiocraft-lora.patch` followed by
+`patches/audiocraft-scratch.patch` before running this script.
+
+```bash
+git -C audiocraft apply ../patches/audiocraft-lora.patch
+git -C audiocraft apply ../patches/audiocraft-scratch.patch
+```
 
 The default first stage is 20,000 optimizer updates over random 10-second crops.
 Batch size 1 with eight-way gradient accumulation gives an effective per-GPU

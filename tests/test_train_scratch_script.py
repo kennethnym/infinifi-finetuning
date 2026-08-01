@@ -36,27 +36,27 @@ class TrainScratchScriptTest(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         arguments = set(result.stdout.splitlines())
         expected = {
-            "model/lm/model_scale=lofi_student",
+            "model/lm/model_scale=base",
             "continue_from=null",
             "transformer_lm.dim=640",
             "transformer_lm.num_heads=10",
             "transformer_lm.num_layers=10",
-            "transformer_lm.lora.enabled=false",
+            "++transformer_lm.lora.enabled=false",
             "conditioners.description.t5.finetune=false",
             "dataset.batch_size=1",
             "dataset.segment_duration=10",
             "optim.epochs=20",
             "optim.updates_per_epoch=1000",
-            "optim.grad_accumulation_steps=8",
+            "++optim.grad_accumulation_steps=8",
             "optim.ema.use=false",
             "distillation.enabled=true",
             "distillation.teacher_checkpoint=facebook/musicgen-large",
             "distillation.temperature=2",
-            "distillation.initial_kl_weight=0.5",
-            "distillation.initial_ce_weight=0.5",
+            "++distillation.initial_kl_weight=0.5",
+            "++distillation.initial_ce_weight=0.5",
             "distillation.kl_weight=0.75",
             "distillation.ce_weight=0.25",
-            "distillation.weight_schedule_updates=10000",
+            "++distillation.weight_schedule_updates=10000",
             "distillation.cfg_branches=true",
         }
         self.assertTrue(expected.issubset(arguments), expected - arguments)

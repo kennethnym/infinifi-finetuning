@@ -317,7 +317,7 @@ dora_args=(
     -P audiocraft
     run
     solver=musicgen/musicgen_base_32khz
-    model/lm/model_scale=lofi_student
+    model/lm/model_scale=base
     "$scratch_continue_arg"
     conditioner=text2music
     dset=audio/lofi
@@ -325,7 +325,7 @@ dora_args=(
     "transformer_lm.dim=${scratch_dim}"
     "transformer_lm.num_heads=${scratch_heads}"
     "transformer_lm.num_layers=${scratch_layers}"
-    transformer_lm.lora.enabled=false
+    ++transformer_lm.lora.enabled=false
     conditioners.description.t5.finetune=false
     conditioners.description.t5.word_dropout=0
     classifier_free_guidance.training_dropout=0
@@ -345,7 +345,7 @@ dora_args=(
     generate.lm.prompted_samples=false
     "optim.epochs=${scratch_epochs}"
     "optim.updates_per_epoch=${scratch_updates_per_epoch}"
-    "optim.grad_accumulation_steps=${scratch_grad_accumulation}"
+    "++optim.grad_accumulation_steps=${scratch_grad_accumulation}"
     optim.optimizer=adamw
     "optim.lr=${scratch_lr}"
     "optim.adam.betas=[0.9,0.95]"
@@ -358,11 +358,11 @@ dora_args=(
     distillation.enabled=true
     "distillation.teacher_checkpoint=${scratch_teacher}"
     "distillation.temperature=${scratch_temperature}"
-    "distillation.initial_kl_weight=${scratch_initial_kd_weight}"
-    "distillation.initial_ce_weight=${scratch_initial_ce_weight}"
+    "++distillation.initial_kl_weight=${scratch_initial_kd_weight}"
+    "++distillation.initial_ce_weight=${scratch_initial_ce_weight}"
     "distillation.kl_weight=${scratch_kd_weight}"
     "distillation.ce_weight=${scratch_ce_weight}"
-    "distillation.weight_schedule_updates=${scratch_weight_transition_updates}"
+    "++distillation.weight_schedule_updates=${scratch_weight_transition_updates}"
     "distillation.cfg_branches=${scratch_cfg_branches}"
 )
 
