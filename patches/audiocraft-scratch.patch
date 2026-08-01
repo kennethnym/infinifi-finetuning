@@ -1,3 +1,38 @@
+diff --git a/audiocraft/models/musicgen.py b/audiocraft/models/musicgen.py
+index 463f61c..d1f6ba6 100644
+--- a/audiocraft/models/musicgen.py
++++ b/audiocraft/models/musicgen.py
+@@ -95,3 +95,4 @@ class MusicGen(BaseGenModel):
+                               duration: float = 30.0, cfg_coef: float = 3.0,
+-                              two_step_cfg: bool = False, extend_stride: float = 18):
++                              two_step_cfg: bool = False,
++                              extend_stride: tp.Optional[float] = None):
+         """Set the generation parameters for MusicGen.
+@@ -108,6 +109,9 @@ class MusicGen(BaseGenModel):
+                 are padded but seems to have little impact in practice.
+-            extend_stride: when doing extended generation (i.e. more than 30 seconds), by how much
+-                should we extend the audio each time. Larger values will mean less context is
+-                preserved, and shorter value will require extra computations.
++            extend_stride: when doing extended generation, by how much should we extend the audio
++                each time. Defaults to 60% of the model's maximum duration, capped at 18 seconds.
++                Larger values will mean less context is preserved, and shorter values will require
++                extra computations.
+         """
++        if extend_stride is None:
++            extend_stride = min(18., 0.6 * self.max_duration)
+         assert extend_stride < self.max_duration, "Cannot stride by more than max generation duration."
+diff --git a/tests/models/test_musicgen.py b/tests/models/test_musicgen.py
+index 2b32ac5..df593ef 100644
+--- a/tests/models/test_musicgen.py
++++ b/tests/models/test_musicgen.py
+@@ -26,1 +26,7 @@ class TestMusicGenModel:
++    def test_default_stride_adapts_to_short_context(self):
++        mg = self.get_musicgen()
++        short_context = MusicGen(
++            'debug-short', mg.compression_model, mg.lm, max_duration=10.)
++        assert short_context.extend_stride == 6.
++
+     def test_generate_unconditional(self):
 diff --git a/audiocraft/solvers/base.py b/audiocraft/solvers/base.py
 index 0432e44..a8a4ea7 100644
 --- a/audiocraft/solvers/base.py
