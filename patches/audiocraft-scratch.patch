@@ -305,19 +305,6 @@ index 93e4e8e..9c44494 100644
              for k, kd_q in enumerate(kd_per_codebook):
                  metrics[f'kd_q{k + 1}'] = kd_q
          for k, ce_q in enumerate(ce_per_codebook):
-diff --git a/config/model/lm/model_scale/lofi_student.yaml b/config/model/lm/model_scale/lofi_student.yaml
-new file mode 100644
-index 0000000..1caee34
---- /dev/null
-+++ b/config/model/lm/model_scale/lofi_student.yaml
-@@ -0,0 +1,7 @@
-+# @package _global_
-+
-+# Compact ~77M parameter MusicGen student for lo-fi specialization.
-+transformer_lm:
-+  dim: 640
-+  num_heads: 10
-+  num_layers: 10
 diff --git a/config/solver/musicgen/default.yaml b/config/solver/musicgen/default.yaml
 index 5571b6a..ac1c96e 100644
 --- a/config/solver/musicgen/default.yaml

@@ -74,7 +74,6 @@ class LoRAPatchIntegrationTest(unittest.TestCase):
             "diff --git a/audiocraft/solvers/base.py b/audiocraft/solvers/base.py",
             "diff --git a/audiocraft/solvers/builders.py b/audiocraft/solvers/builders.py",
             "diff --git a/audiocraft/solvers/musicgen.py b/audiocraft/solvers/musicgen.py",
-            "diff --git a/config/model/lm/model_scale/lofi_student.yaml b/config/model/lm/model_scale/lofi_student.yaml",
             "diff --git a/config/solver/musicgen/default.yaml b/config/solver/musicgen/default.yaml",
         }
         self.assertTrue(
