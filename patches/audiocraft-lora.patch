@@ -521,10 +521,12 @@ diff --git a/audiocraft/solvers/musicgen.py b/audiocraft/solvers/musicgen.py
 index 72b6533..93e4e8e 100644
 --- a/audiocraft/solvers/musicgen.py
 +++ b/audiocraft/solvers/musicgen.py
-@@ -22,7 +22,15 @@ from .. import models
+@@ -22,7 +22,17 @@ from .. import models
  from ..data.audio_dataset import AudioDataset
  from ..data.music_dataset import MusicDataset, MusicInfo, AudioInfo
  from ..data.audio_utils import normalize_audio
++import math
++from torch import nn
 -from ..modules.conditioners import JointEmbedCondition, SegmentWithAttributes, WavCondition
 +from ..modules.conditioners import (
 +    ClassifierFreeGuidanceDropout,
@@ -534,7 +536,7 @@ index 72b6533..93e4e8e 100644
 +    SegmentWithAttributes,
 +    WavCondition,
 +)
-+from ..modules.lora import mark_only_lora_as_trainable
++from ..modules.lora import GatedLoRAProjection, mark_only_lora_as_trainable
  from ..utils.cache import CachedBatchWriter, CachedBatchLoader
  from ..utils.samples.manager import SampleManager
  from ..utils.utils import get_dataset_from_loader, is_jsonable, warn_once, model_hash
@@ -568,7 +570,7 @@ index 72b6533..93e4e8e 100644
 
      @property
      def best_metric_name(self) -> tp.Optional[str]:
-@@ -136,12 +153,86 @@ class MusicGenSolver(base.StandardSolver):
+@@ -136,12 +153,99 @@ class MusicGenSolver(base.StandardSolver):
                           self.compression_model.frame_rate)
          # instantiate LM model
          self.model: models.LMModel = models.builders.get_lm_model(self.cfg).to(self.device)
@@ -622,6 +624,19 @@ index 72b6533..93e4e8e 100644
 +            )
 +            self.teacher_model = models.loaders.load_lm_model(
 +                teacher_checkpoint, device=self.device)
++            teacher_adapter_scale = float(
++                distillation_cfg.teacher_adapter_scale
++            )
++            projection_count = self._apply_teacher_adapter_scale(
++                self.teacher_model,
++                teacher_adapter_scale,
++            )
++            if projection_count:
++                self.logger.info(
++                    "Applied teacher adapter scale %.3f to %d LoRA projections.",
++                    teacher_adapter_scale,
++                    projection_count,
++                )
 +            self.teacher_model.requires_grad_(False)
 +            self.teacher_model.eval()
 +            if self.teacher_model.card != self.model.card:
@@ -846,6 +861,34 @@ index 72b6533..93e4e8e 100644
          for k, ce_q in enumerate(ce_per_codebook):
              metrics[f'ce_q{k + 1}'] = ce_q
              metrics[f'ppl_q{k + 1}'] = torch.exp(ce_q)
+@@ -721,1 +989,27 @@ class MusicGenSolver(base.StandardSolver):
+             return {**metrics, **gen_metrics}
++
++    @staticmethod
++    def _apply_teacher_adapter_scale(
++        teacher: nn.Module,
++        scale: float,
++    ) -> int:
++        if not math.isfinite(scale) or scale < 0:
++            raise ValueError(
++                "Teacher adapter scale must be finite and non-negative."
++            )
++
++        projections = [
++            module
++            for module in teacher.modules()
++            if isinstance(module, GatedLoRAProjection)
++        ]
++
++        if scale != 1.0 and not projections:
++            raise ValueError(
++                "A non-default teacher adapter scale requires a LoRA-enabled teacher."
++            )
++
++        for projection in projections:
++            projection.scaling *= scale
++
++        return len(projections)
 diff --git a/config/model/lm/default.yaml b/config/model/lm/default.yaml
 index 2d256ad..4d86e53 100644
 --- a/config/model/lm/default.yaml
@@ -865,13 +908,14 @@ diff --git a/config/solver/musicgen/default.yaml b/config/solver/musicgen/defaul
 index 8bdf9c7..5571b6a 100644
 --- a/config/solver/musicgen/default.yaml
 +++ b/config/solver/musicgen/default.yaml
-@@ -34,6 +34,14 @@ cache:
+@@ -34,6 +34,15 @@ cache:
    write_shard: 0
    write_num_shards: 1
 
 +distillation:
 +  enabled: false
 +  teacher_checkpoint: facebook/musicgen-large
++  teacher_adapter_scale: 1.0
 +  temperature: 2.0
 +  kl_weight: 0.75
 +  ce_weight: 0.25
@@ -1047,7 +1091,7 @@ new file mode 100644
 index 0000000..81b856d
 --- /dev/null
 +++ b/tests/solvers/test_musicgen_distillation.py
-@@ -0,0 +1,92 @@
+@@ -0,0 +1,186 @@
 +from types import SimpleNamespace
 +
 +import pytest
@@ -1140,3 +1184,97 @@ index 0000000..81b856d
 +    assert values.shape == (2, 3, 2)
 +    assert mask.tolist() == [[1, 1, 1], [0, 0, 0]]
 +    assert values[1].tolist() == [[7.0, 8.0], [0.0, 0.0], [0.0, 0.0]]
++
++
++def test_teacher_adapter_scale_halves_every_projection():
++    from torch import nn
++    from audiocraft.modules.lora import GatedLoRAProjection, LoRAConfig
++
++    config = LoRAConfig(enabled=True, rank=2, alpha=2.0)
++    teacher = nn.Sequential(
++        GatedLoRAProjection(4, 4, config),
++        nn.Sequential(GatedLoRAProjection(4, 4, config)),
++    )
++
++    assert MusicGenSolver._apply_teacher_adapter_scale(teacher, 0.5) == 2
++    assert [module.scaling for module in teacher.modules()
++            if isinstance(module, GatedLoRAProjection)] == [0.5, 0.5]
++
++
++def test_teacher_adapter_scale_zero_disables_every_projection():
++    from torch import nn
++    from audiocraft.modules.lora import GatedLoRAProjection, LoRAConfig
++
++    config = LoRAConfig(enabled=True, rank=2, alpha=2.0)
++    teacher = nn.Sequential(GatedLoRAProjection(4, 4, config))
++
++    MusicGenSolver._apply_teacher_adapter_scale(teacher, 0.0)
++
++    projection = next(module for module in teacher.modules()
++                      if isinstance(module, GatedLoRAProjection))
++    assert projection.scaling == 0.0
++
++
++def test_teacher_adapter_scale_one_preserves_existing_scaling():
++    from torch import nn
++    from audiocraft.modules.lora import GatedLoRAProjection, LoRAConfig
++
++    config = LoRAConfig(enabled=True, rank=2, alpha=2.0)
++    teacher = nn.Sequential(GatedLoRAProjection(4, 4, config))
++    projection = next(module for module in teacher.modules()
++                      if isinstance(module, GatedLoRAProjection))
++
++    MusicGenSolver._apply_teacher_adapter_scale(teacher, 1.0)
++
++    assert projection.scaling == 1.0
++
++
++@pytest.mark.parametrize("scale", [-1.0, float("nan"), float("inf")])
++def test_teacher_adapter_scale_rejects_invalid_values(scale):
++    from torch import nn
++    from audiocraft.modules.lora import GatedLoRAProjection, LoRAConfig
++
++    config = LoRAConfig(enabled=True, rank=2, alpha=2.0)
++    teacher = nn.Sequential(GatedLoRAProjection(4, 4, config))
++
++    with pytest.raises(ValueError, match="finite and non-negative"):
++        MusicGenSolver._apply_teacher_adapter_scale(teacher, scale)
++
++
++def test_non_default_teacher_adapter_scale_requires_lora_projections():
++    from torch import nn
++
++    with pytest.raises(ValueError, match="LoRA-enabled teacher"):
++        MusicGenSolver._apply_teacher_adapter_scale(nn.Linear(4, 4), 0.5)
++    assert MusicGenSolver._apply_teacher_adapter_scale(nn.Linear(4, 4), 1.0) == 0
++
++
++def test_teacher_adapter_scale_does_not_modify_student_projections():
++    from torch import nn
++    from audiocraft.modules.lora import GatedLoRAProjection, LoRAConfig
++
++    config = LoRAConfig(enabled=True, rank=2, alpha=2.0)
++    teacher = nn.Sequential(GatedLoRAProjection(4, 4, config))
++    student = nn.Sequential(GatedLoRAProjection(4, 4, config))
++
++    MusicGenSolver._apply_teacher_adapter_scale(teacher, 0.5)
++
++    teacher_projection = next(module for module in teacher.modules()
++                              if isinstance(module, GatedLoRAProjection))
++    student_projection = next(module for module in student.modules()
++                              if isinstance(module, GatedLoRAProjection))
++    assert teacher_projection.scaling == 0.5
++    assert student_projection.scaling == 1.0
++
++
++def test_reconstructed_teacher_scale_is_not_compounded():
++    from torch import nn
++    from audiocraft.modules.lora import GatedLoRAProjection, LoRAConfig
++
++    config = LoRAConfig(enabled=True, rank=2, alpha=2.0)
++    for _ in range(2):
++        teacher = nn.Sequential(GatedLoRAProjection(4, 4, config))
++        MusicGenSolver._apply_teacher_adapter_scale(teacher, 0.5)
++        projection = next(module for module in teacher.modules()
++                          if isinstance(module, GatedLoRAProjection))
++        assert projection.scaling == 0.5
