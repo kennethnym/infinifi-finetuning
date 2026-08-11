@@ -133,6 +133,9 @@ python eval/generate.py \
   --run-name baseline_musicgen_small
 ```
 
+Generation defaults to 30-second clips. Use a distinct run name when testing
+another duration, for example `--duration 10` for native 10-second generation.
+
 The run generates all 30 prompts with the default seeds 42, 43, 44, and 45 for
 120 WAV clips. Generation uses a 30-second duration, sampling enabled, CFG 3.0,
 temperature 1.0, top-k 250, top-p disabled, and WAV loudness normalization.

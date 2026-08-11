@@ -228,6 +228,23 @@ class EvalGenerateTest(unittest.TestCase):
         ):
             generate.validate_args(args, prompt_count=1)
 
+    def test_rejects_invalid_duration(self) -> None:
+        args = SimpleNamespace(
+            run_name="test-run",
+            limit=None,
+            seeds=[42],
+            model="model",
+            batch_size=1,
+            duration=0,
+            cfg_coef=3.0,
+            adapter_scale=1.0,
+        )
+
+        with self.assertRaisesRegex(
+            RuntimeError, "--duration must be a finite positive number"
+        ):
+            generate.validate_args(args, prompt_count=1)
+
     def test_rejects_invalid_adapter_scale(self) -> None:
         args = SimpleNamespace(
             run_name="test-run",
@@ -249,6 +266,7 @@ class EvalGenerateTest(unittest.TestCase):
             run_name="test-run",
             seeds=[42],
             batch_size=1,
+            duration=10.0,
             cfg_coef=5.0,
             adapter_scale=0.25,
         )
@@ -261,6 +279,7 @@ class EvalGenerateTest(unittest.TestCase):
                 {"type": "lora_adapter", "base_model": "test-model"},
             )
 
+        self.assertEqual(config["generation"]["duration"], 10.0)
         self.assertEqual(config["generation"]["cfg_coef"], 5.0)
         self.assertEqual(config["adapter_scale"], 0.25)
         self.assertEqual(generate.DEFAULT_GENERATION_PARAMS["cfg_coef"], 3.0)
