@@ -120,6 +120,12 @@ def parse_args() -> argparse.Namespace:
         help="Generate up to this many prompts in parallel (default: 1).",
     )
     parser.add_argument(
+        "--duration",
+        type=float,
+        default=DEFAULT_GENERATION_PARAMS["duration"],
+        help="Generated clip duration in seconds (default: 30).",
+    )
+    parser.add_argument(
         "--cfg-coef",
         type=float,
         default=DEFAULT_GENERATION_PARAMS["cfg_coef"],
@@ -286,6 +292,9 @@ def validate_args(args: argparse.Namespace, prompt_count: int) -> Path:
         raise RuntimeError("--model cannot be empty")
     if args.batch_size <= 0:
         raise RuntimeError("--batch-size must be greater than zero")
+    duration = getattr(args, "duration", DEFAULT_GENERATION_PARAMS["duration"])
+    if not math.isfinite(duration) or duration <= 0:
+        raise RuntimeError("--duration must be a finite positive number")
     if not math.isfinite(args.cfg_coef) or args.cfg_coef <= 0:
         raise RuntimeError("--cfg-coef must be a finite positive number")
     if not math.isfinite(args.adapter_scale) or args.adapter_scale < 0:
@@ -333,9 +342,13 @@ def validate_args(args: argparse.Namespace, prompt_count: int) -> Path:
     return output_dir
 
 
-def generation_params(cfg_coef: float) -> dict[str, Any]:
+def generation_params(
+    cfg_coef: float,
+    duration: float = DEFAULT_GENERATION_PARAMS["duration"],
+) -> dict[str, Any]:
     return {
         **DEFAULT_GENERATION_PARAMS,
+        "duration": duration,
         "cfg_coef": cfg_coef,
     }
 
@@ -343,6 +356,11 @@ def generation_params(cfg_coef: float) -> dict[str, Any]:
 def ace_step_generation_params(args: argparse.Namespace) -> dict[str, Any]:
     return {
         **ACE_STEP_DEFAULT_PARAMS,
+        "duration": getattr(
+            args,
+            "duration",
+            ACE_STEP_DEFAULT_PARAMS["duration"],
+        ),
         "inference_steps": getattr(
             args,
             "ace_steps",
@@ -651,7 +669,10 @@ def build_locked_config(
         "seeds": args.seeds,
         "batch_size": args.batch_size,
         "generation": (
-            generation_params(args.cfg_coef)
+            generation_params(
+                args.cfg_coef,
+                getattr(args, "duration", DEFAULT_GENERATION_PARAMS["duration"]),
+            )
             if backend == "musicgen"
             else ace_step_generation_params(args)
         ),
