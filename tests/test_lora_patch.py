@@ -37,6 +37,19 @@ class LoRAPatchIntegrationTest(unittest.TestCase):
             "apply /workspace/patches/audiocraft-scratch.patch",
             dockerfile,
         )
+        self.assertIn(
+            "COPY patches/audiocraft-recovery.patch "
+            "/workspace/patches/audiocraft-recovery.patch",
+            dockerfile,
+        )
+        self.assertIn(
+            "apply --check --unidiff-zero /workspace/patches/audiocraft-recovery.patch",
+            dockerfile,
+        )
+        self.assertIn(
+            "apply --unidiff-zero /workspace/patches/audiocraft-recovery.patch",
+            dockerfile,
+        )
 
         for relative_path in (
             "export_adapter.py",
@@ -86,6 +99,34 @@ class LoRAPatchIntegrationTest(unittest.TestCase):
         self.assertIn("test_default_stride_adapts_to_short_context", patch)
         self.assertIn("grad_accumulation_steps", patch)
         self.assertIn("self.compression_model.requires_grad_(False)", patch)
+
+    def test_recovery_patch_contains_student_prefix_distillation(self) -> None:
+        patch = (
+            PROJECT_ROOT / "patches" / "audiocraft-recovery.patch"
+        ).read_text(encoding="utf-8")
+
+        expected_headers = {
+            "diff --git a/audiocraft/solvers/musicgen.py b/audiocraft/solvers/musicgen.py",
+            "diff --git a/config/solver/musicgen/default.yaml b/config/solver/musicgen/default.yaml",
+            "diff --git a/tests/solvers/test_musicgen_distillation.py b/tests/solvers/test_musicgen_distillation.py",
+        }
+        self.assertTrue(
+            expected_headers.issubset(set(patch.splitlines())),
+            expected_headers - set(patch.splitlines()),
+        )
+
+        for expected in (
+            "_scheduled_recovery_ratio",
+            "_deterministic_recovery_choice",
+            "_prepare_recovery_tokens_and_attributes",
+            "_mask_recovery_prefix",
+            "_distillation_objective",
+            "recovery_batch=True",
+            "enabled: false",
+            "prefix_duration: 2.0",
+            "loss_duration: 2.0",
+        ):
+            self.assertIn(expected, patch)
 
 
 if __name__ == "__main__":

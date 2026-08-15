@@ -47,6 +47,7 @@ WORKDIR /workspace
 COPY audiocraft-requirements.txt pipeline-requirements.txt ./
 COPY patches/audiocraft-lora.patch /workspace/patches/audiocraft-lora.patch
 COPY patches/audiocraft-scratch.patch /workspace/patches/audiocraft-scratch.patch
+COPY patches/audiocraft-recovery.patch /workspace/patches/audiocraft-recovery.patch
 
 RUN sed '/^nvidia-/d; /^pip==/d; /^setuptools==/d' \
         audiocraft-requirements.txt > /tmp/audiocraft-requirements.txt \
@@ -59,6 +60,8 @@ RUN git clone https://github.com/facebookresearch/audiocraft.git /workspace/audi
     && git -C /workspace/audiocraft apply /workspace/patches/audiocraft-lora.patch \
     && git -C /workspace/audiocraft apply --check /workspace/patches/audiocraft-scratch.patch \
     && git -C /workspace/audiocraft apply /workspace/patches/audiocraft-scratch.patch \
+    && git -C /workspace/audiocraft apply --check --unidiff-zero /workspace/patches/audiocraft-recovery.patch \
+    && git -C /workspace/audiocraft apply --unidiff-zero /workspace/patches/audiocraft-recovery.patch \
     && python -m pip install --no-cache-dir --no-deps -e /workspace/audiocraft \
     && rm -rf /workspace/audiocraft/.git
 

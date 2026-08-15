@@ -1,0 +1,391 @@
+diff --git a/audiocraft/solvers/musicgen.py b/audiocraft/solvers/musicgen.py
+index cac9354..743e70a 100644
+--- a/audiocraft/solvers/musicgen.py
++++ b/audiocraft/solvers/musicgen.py
+@@ -122,0 +123,3 @@ class MusicGenSolver(base.StandardSolver):
++            'recovery': '.3f',
++            'recovery_ratio': '.3f',
++            'recovery_kd': '.3f',
+@@ -227,0 +231,62 @@ class MusicGenSolver(base.StandardSolver):
++            recovery_cfg = distillation_cfg.recovery
++            recovery_enabled = bool(recovery_cfg.enabled)
++            if recovery_enabled:
++                recovery_ratio = float(recovery_cfg.ratio)
++                if (
++                    not math.isfinite(recovery_ratio)
++                    or recovery_ratio <= 0
++                    or recovery_ratio >= 1
++                ):
++                    raise ValueError(
++                        "Recovery ratio must be finite and strictly between zero and one."
++                    )
++                for name in ('start_update', 'ramp_updates', 'top_k'):
++                    value = recovery_cfg[name]
++                    if (
++                        isinstance(value, bool)
++                        or not isinstance(value, int)
++                        or value < 0
++                    ):
++                        raise ValueError(
++                            f"Recovery {name} must be a non-negative integer."
++                        )
++                for name in ('prefix_duration', 'loss_duration', 'sampling_temperature'):
++                    value = float(recovery_cfg[name])
++                    if not math.isfinite(value) or value <= 0:
++                        raise ValueError(
++                            f"Recovery {name} must be finite and positive."
++                        )
++                top_p = float(recovery_cfg.top_p)
++                if not math.isfinite(top_p) or top_p < 0 or top_p >= 1:
++                    raise ValueError(
++                        "Recovery top_p must be finite and in the interval [0, 1)."
++                    )
++                if recovery_cfg.top_k > 0 and top_p > 0:
++                    raise ValueError(
++                        "Recovery top_k and top_p cannot both be enabled."
++                    )
++                cfg_coef = float(recovery_cfg.cfg_coef)
++                if not math.isfinite(cfg_coef) or cfg_coef < 0:
++                    raise ValueError(
++                        "Recovery cfg_coef must be finite and non-negative."
++                    )
++                if (
++                    float(recovery_cfg.prefix_duration)
++                    + float(recovery_cfg.loss_duration)
++                    > float(self.cfg.dataset.segment_duration)
++                ):
++                    raise ValueError(
++                        "Recovery prefix and loss durations must fit within "
++                        "dataset.segment_duration."
++                    )
++                if (
++                    distillation_cfg.initial_kl_weight <= 0
++                    or distillation_cfg.kl_weight <= 0
++                ):
++                    raise ValueError(
++                        "Recovery requires positive initial and final KL weights."
++                    )
++                if self.cfg.cache.path and self.cfg.cache.write:
++                    raise ValueError(
++                        "Recovery cannot run while writing the training-token cache."
++                    )
+@@ -291,0 +357,11 @@ class MusicGenSolver(base.StandardSolver):
++            if recovery_enabled:
++                self.logger.info(
++                    "Student-prefix recovery enabled at target ratio %.3f after "
++                    "%d updates, ramping over %d updates with %.2f s prefixes "
++                    "and %.2f s KL spans.",
++                    recovery_ratio,
++                    recovery_cfg.start_update,
++                    recovery_cfg.ramp_updates,
++                    recovery_cfg.prefix_duration,
++                    recovery_cfg.loss_duration,
++                )
+@@ -467,5 +543 @@ class MusicGenSolver(base.StandardSolver):
+-        completed_updates = max(self.epoch - 1, 0) * self.train_updates_per_epoch
+-        if self.is_training:
+-            completed_updates += batch_index // self.gradient_accumulation_steps
+-        else:
+-            completed_updates += self.train_updates_per_epoch
++        completed_updates = self._completed_updates(batch_index)
+@@ -481,0 +554,87 @@ class MusicGenSolver(base.StandardSolver):
++    def _completed_updates(self, batch_index: int) -> int:
++        completed_updates = max(self.epoch - 1, 0) * self.train_updates_per_epoch
++        if self.is_training:
++            completed_updates += batch_index // self.gradient_accumulation_steps
++        else:
++            completed_updates += self.train_updates_per_epoch
++        return completed_updates
++
++    @staticmethod
++    def _scheduled_recovery_ratio(
++        target_ratio: float,
++        start_update: int,
++        ramp_updates: int,
++        completed_updates: int,
++    ) -> float:
++        """Ramp the share of recovery microbatches by optimizer update."""
++        if completed_updates < start_update:
++            return 0.0
++        if ramp_updates == 0:
++            return target_ratio
++        elapsed_updates = completed_updates - start_update + 1
++        progress = min(max(elapsed_updates / ramp_updates, 0.0), 1.0)
++        return target_ratio * progress
++
++    @staticmethod
++    def _deterministic_recovery_choice(
++        ratio: float,
++        global_batch_index: int,
++        seed: int,
++    ) -> bool:
++        """Choose recovery batches identically on every distributed rank."""
++        if ratio <= 0:
++            return False
++        if ratio >= 1:
++            return True
++        value = (global_batch_index + seed + 0x9E3779B9) & 0xFFFFFFFF
++        value = ((value ^ (value >> 16)) * 0x21F0AAAD) & 0xFFFFFFFF
++        value = ((value ^ (value >> 15)) * 0x735A2D97) & 0xFFFFFFFF
++        value = (value ^ (value >> 15)) & 0xFFFFFFFF
++        return value < int(ratio * (1 << 32))
++
++    def _recovery_batch_state(self, batch_index: int) -> tp.Tuple[bool, float]:
++        recovery_cfg = self.cfg.distillation.recovery
++        if not self.is_training or not bool(recovery_cfg.enabled):
++            return False, 0.0
++        ratio = self._scheduled_recovery_ratio(
++            float(recovery_cfg.ratio),
++            int(recovery_cfg.start_update),
++            int(recovery_cfg.ramp_updates),
++            self._completed_updates(batch_index),
++        )
++        global_batch_index = (
++            max(self.epoch - 1, 0) * self.train_batches_per_epoch
++            + batch_index
++        )
++        use_recovery = self._deterministic_recovery_choice(
++            ratio, global_batch_index, int(self.cfg.seed))
++        return use_recovery, ratio
++
++    @staticmethod
++    def _mask_recovery_prefix(
++        mask: torch.Tensor,
++        prefix_tokens: int,
++    ) -> torch.Tensor:
++        if prefix_tokens <= 0 or prefix_tokens >= mask.shape[-1]:
++            raise ValueError(
++                "Recovery prefix must leave at least one token for KL training."
++            )
++        recovery_mask = mask.clone()
++        recovery_mask[..., :prefix_tokens] = False
++        return recovery_mask
++
++    @staticmethod
++    def _distillation_objective(
++        kd: torch.Tensor,
++        ce: tp.Optional[torch.Tensor],
++        kd_weight: float,
++        ce_weight: float,
++        recovery_batch: bool,
++    ) -> tp.Tuple[torch.Tensor, float]:
++        """Combine normal losses or route recovery batches to KL only."""
++        if recovery_batch:
++            return kd_weight * kd, 0.0
++        if ce is None:
++            raise ValueError("Normal distillation requires cross entropy.")
++        return kd_weight * kd + ce_weight * ce, ce_weight
++
+@@ -564,0 +724,36 @@ class MusicGenSolver(base.StandardSolver):
++    def _prepare_recovery_tokens_and_attributes(
++        self,
++        batch: tp.Tuple[torch.Tensor, tp.List[SegmentWithAttributes]],
++    ) -> tp.Tuple[dict, torch.Tensor, torch.Tensor]:
++        """Sample student rollouts and mask KL to the post-prefix span."""
++        attributes = self._distillation_attributes(batch)
++        recovery_cfg = self.cfg.distillation.recovery
++        prefix_tokens = math.ceil(
++            float(recovery_cfg.prefix_duration) * self.compression_model.frame_rate)
++        loss_tokens = math.ceil(
++            float(recovery_cfg.loss_duration) * self.compression_model.frame_rate)
++        was_training = self.model.training
++        self.model.eval()
++        try:
++            with torch.no_grad(), self.autocast:
++                audio_tokens = self.model.generate(
++                    conditions=attributes,
++                    max_gen_len=prefix_tokens + loss_tokens,
++                    use_sampling=True,
++                    temp=float(recovery_cfg.sampling_temperature),
++                    top_k=int(recovery_cfg.top_k),
++                    top_p=float(recovery_cfg.top_p),
++                    cfg_coef=float(recovery_cfg.cfg_coef),
++                )
++        finally:
++            self.model.train(was_training)
++
++        with self.autocast:
++            tokenized = self.model.condition_provider.tokenize(attributes)
++            condition_tensors = self.model.condition_provider(tokenized)
++        padding_mask = torch.ones_like(
++            audio_tokens, dtype=torch.bool, device=audio_tokens.device)
++        padding_mask = self._mask_recovery_prefix(
++            padding_mask, prefix_tokens)
++        return condition_tensors, audio_tokens, padding_mask
++
+@@ -673,0 +869 @@ class MusicGenSolver(base.StandardSolver):
++        recovery_batch, recovery_ratio = self._recovery_batch_state(idx)
+@@ -675,2 +871,8 @@ class MusicGenSolver(base.StandardSolver):
+-        condition_tensors, audio_tokens, padding_mask = self._prepare_tokens_and_attributes(
+-            batch, check_synchronization_points)
++        if recovery_batch:
++            condition_tensors, audio_tokens, padding_mask = (
++                self._prepare_recovery_tokens_and_attributes(batch))
++            self.deadlock_detect.update('recovery_rollout')
++        else:
++            condition_tensors, audio_tokens, padding_mask = (
++                self._prepare_tokens_and_attributes(
++                    batch, check_synchronization_points))
+@@ -685,0 +888,2 @@ class MusicGenSolver(base.StandardSolver):
++        ce = None
++        ce_per_codebook: tp.List[torch.Tensor] = []
+@@ -708 +912,3 @@ class MusicGenSolver(base.StandardSolver):
+-            ce, ce_per_codebook = self._compute_cross_entropy(logits, audio_tokens, mask)
++            if not recovery_batch:
++                ce, ce_per_codebook = self._compute_cross_entropy(
++                    logits, audio_tokens, mask)
+@@ -709,0 +916 @@ class MusicGenSolver(base.StandardSolver):
++                assert ce is not None
+@@ -722,4 +929,2 @@ class MusicGenSolver(base.StandardSolver):
+-                loss = (
+-                    kd_weight * kd
+-                    + ce_weight * ce
+-                )
++                loss, ce_weight = self._distillation_objective(
++                    kd, ce, kd_weight, ce_weight, recovery_batch)
+@@ -783,2 +988,6 @@ class MusicGenSolver(base.StandardSolver):
+-        metrics['ce'] = ce
+-        metrics['ppl'] = torch.exp(ce)
++        if self.is_training and bool(self.cfg.distillation.recovery.enabled):
++            metrics['recovery'] = float(recovery_batch)
++            metrics['recovery_ratio'] = recovery_ratio
++        if ce is not None:
++            metrics['ce'] = ce
++            metrics['ppl'] = torch.exp(ce)
+@@ -789,0 +999,2 @@ class MusicGenSolver(base.StandardSolver):
++            if recovery_batch:
++                metrics['recovery_kd'] = kd.detach()
+diff --git a/config/solver/musicgen/default.yaml b/config/solver/musicgen/default.yaml
+index ad43b67..4a1a49e 100644
+--- a/config/solver/musicgen/default.yaml
++++ b/config/solver/musicgen/default.yaml
+@@ -47,0 +48,11 @@ distillation:
++  recovery:
++    enabled: false
++    ratio: 0.05
++    start_update: 5000
++    ramp_updates: 2000
++    prefix_duration: 2.0
++    loss_duration: 2.0
++    sampling_temperature: 1.0
++    top_k: 250
++    top_p: 0.0
++    cfg_coef: 3.0
+diff --git a/tests/solvers/test_musicgen_distillation.py b/tests/solvers/test_musicgen_distillation.py
+index 67d6a2e..2218f63 100644
+--- a/tests/solvers/test_musicgen_distillation.py
++++ b/tests/solvers/test_musicgen_distillation.py
+@@ -0,0 +1 @@
++from contextlib import nullcontext
+@@ -81,0 +83,111 @@ def test_zero_length_distillation_schedule_uses_final_weights():
++def test_recovery_ratio_starts_then_ramps_by_optimizer_update():
++    scheduled = MusicGenSolver._scheduled_recovery_ratio
++
++    assert scheduled(0.05, 100, 20, 99) == 0.0
++    assert scheduled(0.05, 100, 20, 100) == pytest.approx(0.0025)
++    assert scheduled(0.05, 100, 20, 109) == pytest.approx(0.025)
++    assert scheduled(0.05, 100, 20, 119) == pytest.approx(0.05)
++    assert scheduled(0.05, 100, 0, 100) == pytest.approx(0.05)
++
++
++def test_recovery_choice_is_deterministic_and_tracks_target_ratio():
++    choices = [
++        MusicGenSolver._deterministic_recovery_choice(0.05, index, 2036)
++        for index in range(10_000)
++    ]
++
++    assert choices == [
++        MusicGenSolver._deterministic_recovery_choice(0.05, index, 2036)
++        for index in range(10_000)
++    ]
++    assert sum(choices) / len(choices) == pytest.approx(0.05, abs=0.002)
++
++
++def test_recovery_mask_excludes_student_prefix_without_mutating_input():
++    mask = torch.ones((2, 4, 6), dtype=torch.bool)
++
++    recovery_mask = MusicGenSolver._mask_recovery_prefix(mask, 4)
++
++    assert mask.all()
++    assert not recovery_mask[..., :4].any()
++    assert recovery_mask[..., 4:].all()
++
++
++def test_recovery_objective_uses_teacher_kl_only():
++    kd = torch.tensor(2.0, requires_grad=True)
++
++    loss, ce_weight = MusicGenSolver._distillation_objective(
++        kd, None, 0.75, 0.25, recovery_batch=True)
++    loss.backward()
++
++    assert loss.item() == pytest.approx(1.5)
++    assert ce_weight == 0.0
++    assert kd.grad.item() == pytest.approx(0.75)
++
++
++def test_normal_objective_keeps_ce_and_teacher_kl():
++    kd = torch.tensor(2.0)
++    ce = torch.tensor(4.0)
++
++    loss, ce_weight = MusicGenSolver._distillation_objective(
++        kd, ce, 0.75, 0.25, recovery_batch=False)
++
++    assert loss.item() == pytest.approx(2.5)
++    assert ce_weight == pytest.approx(0.25)
++
++
++def test_recovery_rollout_restores_training_mode_and_masks_prefix():
++    class ConditionProvider:
++        def tokenize(self, attributes):
++            return attributes
++
++        def __call__(self, tokenized):
++            return {"description": tokenized}
++
++    class Model:
++        def __init__(self):
++            self.training = True
++            self.condition_provider = ConditionProvider()
++            self.generate_kwargs = None
++
++        def eval(self):
++            self.training = False
++
++        def train(self, mode=True):
++            self.training = mode
++
++        def generate(self, **kwargs):
++            assert not self.training
++            self.generate_kwargs = kwargs
++            return torch.zeros((1, 4, kwargs["max_gen_len"]), dtype=torch.long)
++
++    instance = object.__new__(MusicGenSolver)
++    instance.model = Model()
++    instance.compression_model = SimpleNamespace(frame_rate=5)
++    instance.autocast = nullcontext()
++    instance.cfg = SimpleNamespace(
++        distillation=SimpleNamespace(
++            recovery=SimpleNamespace(
++                prefix_duration=2.0,
++                loss_duration=1.0,
++                sampling_temperature=0.9,
++                top_k=50,
++                top_p=0.0,
++                cfg_coef=3.0,
++            )
++        )
++    )
++    instance._distillation_attributes = lambda batch: ["prompt"]
++
++    conditions, tokens, mask = instance._prepare_recovery_tokens_and_attributes(
++        (torch.empty(1), []))
++
++    assert instance.model.training
++    assert instance.model.generate_kwargs["max_gen_len"] == 15
++    assert instance.model.generate_kwargs["top_k"] == 50
++    assert conditions == {"description": ["prompt"]}
++    assert tokens.shape == (1, 4, 15)
++    assert not mask[..., :10].any()
++    assert mask[..., 10:].all()
++
++
